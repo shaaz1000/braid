@@ -1,0 +1,36 @@
+name: Braid
+options:
+  bundleIdPrefix: com.shaazkhan
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+targets:
+  Braid:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+      # Named explicitly: a bare directory under `resources` is treated as a
+      # folder reference and copies nothing, which shipped an app with no
+      # engine inside it.
+      - path: Resources/braid-engine
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.shaazkhan.braidmac
+        PRODUCT_NAME: braid
+        DEVELOPMENT_TEAM: GRFA8BR7C4
+        CODE_SIGN_STYLE: Automatic
+        # The app launches a bundled helper and talks to it over the loopback,
+        # so the sandbox would have to allow both. Disabled for a local tool.
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: NO
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
+        SWIFT_VERSION: "5.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        COMBINE_HIDPI_IMAGES: YES
