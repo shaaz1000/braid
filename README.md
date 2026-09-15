@@ -65,6 +65,7 @@ braid links                          # what can it use right now?
 braid get <url>                      # download over everything available
 braid get -o ~/Downloads <url>       # choose where it lands
 braid get -o out.iso <url>           # or the exact filename
+braid serve                          # share the bonded speed with every device
 ```
 
 `braid links` tells you whether bonding is even possible:
@@ -90,6 +91,32 @@ two different files together is worse than downloading again.
 | `-chunk <bytes>` | 4 MiB | chunk size. Smaller is measurably worse: 1 MiB managed 82 Mbps where 4 MiB managed 183 |
 | `-workers <n>` | 4 | concurrent fetches per link |
 | `-tail-steal` | off | near the end, let an idle link re-request a chunk stuck on a slow one. Costs duplicate bytes, so it is opt-in |
+
+## Every device on your network
+
+`braid serve` turns the Mac into a bonded gateway. Clients install **nothing**:
+
+```sh
+braid serve
+# braid is sharing 2 uplink(s) on port 8080
+#   http://192.168.1.42:8080/?t=<token>
+```
+
+Open that on a phone, a laptop or a TV and you get a live dashboard. Paste a
+link and press **Stream** to download through the bonded connection, or **Copy
+link** to get a self-contained URL you can paste into VLC or Infuse — it
+carries its own token, because those clients cannot set request headers.
+
+The endpoint answers an ordinary sequential HTTP response while the bytes
+behind it are being fetched out of order over every uplink, and it honours
+`Range` so players can seek. A repeat request for the same URL is served from
+disk, so it costs no mobile data twice.
+
+On iOS, **Add to Home Screen** gives it an icon and a full-screen window.
+
+A deliberate limit: the daemon binds to every interface, because a phone cannot
+reach something listening only on localhost. That exposure is why a token is
+mandatory and why there is no way to turn it off.
 
 ## Getting a second uplink
 
@@ -178,6 +205,8 @@ is no merge pass and no doubled disk use.
 | `internal/probe` | size, splittability, cache validators |
 | `internal/plan` | chunk arithmetic, completion bitmap, resume sidecar |
 | `internal/sched` | shared-queue work stealing, retries, tail stealing |
+| `internal/stream` | serving a file in order while its chunks are still arriving |
+| `internal/server` | the LAN daemon: token auth, live dashboard, `/stream` |
 | `internal/xfer` | one transfer, end to end |
 | `internal/human` | formatting for people |
 | `cmd/braid` | the CLI |
@@ -189,7 +218,7 @@ is no merge pass and no doubled disk use.
 go test ./... -race
 ```
 
-119 assertions across 7 packages. The design keeps this honest: `linkset` and
+172 assertions across 9 packages. The design keeps this honest: `linkset` and
 the dialer sit behind interfaces, so the scheduler, planner, resume logic and
 probe are all exercised with synthetic links and loopback servers — **no phone
 required**. Tests cover a link dying mid-transfer, a server that ignores
@@ -201,7 +230,7 @@ link.
 
 - [x] **Phase 0** — prove `IP_BOUND_IF` really pins traffic, with numbers
 - [x] **Phase 1** — `braid links`, `braid get`
-- [ ] **Phase 2** — `braid serve`: a LAN endpoint so a phone, laptop or Apple TV
+- [x] **Phase 2** — `braid serve`: a LAN endpoint so a phone, laptop or Apple TV
       gets the bonded speed with nothing installed, by streaming bytes in order
       as out-of-order chunks land
 - [ ] **Phase 3** — enforce metered budgets, pick each link's faster address
