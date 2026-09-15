@@ -518,3 +518,50 @@ func (f *fatalFetcher) Fetch(ctx context.Context, start, end int64) ([]byte, err
 	f.calls.Add(1)
 	return nil, fmt.Errorf("server ignored the range: %w", ErrFatal)
 }
+
+// orderCheckingSink asserts the load-bearing invariant for streaming: a
+// chunk's bit must never be set before its bytes are on disk. A reader that
+// wakes on the bitmap reads whatever is at that offset, so publishing early
+// hands it zeros.
+type orderCheckingSink struct {
+	*sink
+	bits       *plan.Bitmap
+	p          plan.Plan
+	violations atomic.Int32
+}
+
+func (s *orderCheckingSink) WriteAt(b []byte, off int64) (int, error) {
+	if s.bits.Get(int(off / s.p.ChunkSize)) {
+		s.violations.Add(1)
+	}
+	return s.sink.WriteAt(b, off)
+}
+
+func TestChunkBytesAreOnDiskBeforeTheBitIsSet(t *testing.T) {
+	data := source(2000)
+	p := plan.New(int64(len(data)), 100) // 20 chunks
+	bits := plan.NewBitmap(p.Chunks)
+	out := &orderCheckingSink{sink: newSink(len(data)), bits: bits, p: p}
+
+	// Tail stealing off, so there is exactly one write per chunk and any
+	// violation is a genuine ordering fault rather than a duplicate writer.
+	cfg := Config{
+		Plan: p, Bits: bits, Out: out,
+		Links: []Link{
+			{Name: "a", Fetcher: &fakeLink{data: data}, Workers: 3},
+			{Name: "b", Fetcher: &fakeLink{data: data}, Workers: 3},
+		},
+		MaxAttempts: 4,
+		Backoff:     func(int) time.Duration { return time.Millisecond },
+	}
+
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !bytes.Equal(out.sink.bytes(), data) {
+		t.Fatal("output does not match the source")
+	}
+	if n := out.violations.Load(); n != 0 {
+		t.Errorf("%d chunk(s) had their bit set before the bytes were written; a streaming reader would serve zeros", n)
+	}
+}

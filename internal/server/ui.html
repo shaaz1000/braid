@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#E9EDEE" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0A2229" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="braid">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>braid</title>
+<!-- Inline so the browser never requests /favicon.ico, which would be a 401
+     against a token-protected server and show up as a broken tab icon. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230A2229'/%3E%3Cpath d='M6 11h5v10H6zM13 11h5v10h-5z' fill='%232BA6C4'/%3E%3Cpath d='M20 11h6v10h-6z' fill='%23E0952F'/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' fill='%230A2229'/%3E%3Crect x='30' y='58' width='26' height='64' rx='3' fill='%232BA6C4'/%3E%3Crect x='64' y='58' width='26' height='64' rx='3' fill='%232BA6C4'/%3E%3Crect x='98' y='58' width='26' height='64' rx='3' fill='%23E0952F'/%3E%3Crect x='132' y='58' width='18' height='64' rx='3' fill='%232BA6C4'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* Cool hues are free, warm hues cost money. That rule drives the palette:
+     you can see at a glance how much of a transfer is being billed to you. */
+  :root {
+    --ground:   #E9EDEE;
+    --surface:  #FFFFFF;
+    --ink:      #10262E;
+    --ink-soft: #4A6470;
+    --ink-faint:#8AA0A9;
+    --rule:     #CFD8DA;
+    --pending:  #D7DEE0;
+
+    --free-1: #1E8FAC;
+    --free-2: #5A6CC4;
+    --free-3: #2F9077;
+    --cost-1: #C97C1B;
+    --cost-2: #A8503C;
+
+    --step: 4px;
+    --radius: 3px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:   #0A2229;
+      --surface:  #0F2E37;
+      --ink:      #E6EEF0;
+      --ink-soft: #9DB4BD;
+      --ink-faint:#5E7B86;
+      --rule:     #1C414C;
+      --pending:  #17353E;
+
+      --free-1: #2BA6C4;
+      --free-2: #7D8EE0;
+      --free-3: #3FA98A;
+      --cost-1: #E0952F;
+      --cost-2: #C7654C;
+    }
+  }
+
+  /* An explicit choice must win in both directions, so the same tokens are
+     also reachable without the media query. */
+  :root[data-theme="dark"] {
+      --ground:   #0A2229;
+      --surface:  #0F2E37;
+      --ink:      #E6EEF0;
+      --ink-soft: #9DB4BD;
+      --ink-faint:#5E7B86;
+      --rule:     #1C414C;
+      --pending:  #17353E;
+
+      --free-1: #2BA6C4;
+      --free-2: #7D8EE0;
+      --free-3: #3FA98A;
+      --cost-1: #E0952F;
+      --cost-2: #C7654C;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    padding: 0 20px 56px;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 720px; margin: 0 auto; }
+
+  /* ---------------------------------------------------------------- header */
+  header {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 16px; padding: 28px 0 22px;
+  }
+  .wordmark {
+    font-size: 21px; font-weight: 600; letter-spacing: -0.02em; margin: 0;
+  }
+  .uplinks { display: flex; align-items: center; gap: 9px; color: var(--ink-soft); font-size: 13.5px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .dot.gone { background: var(--pending) !important; }
+
+  /* ----------------------------------------------------------- the weave */
+  /* The band IS the file, byte zero to the end. Each cell is a chunk, painted
+     in the colour of the link that fetched it — so two colours visibly stitch
+     toward each other, out of order, as the transfer runs. */
+  .weave-wrap { background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius); padding: 18px; }
+  .weave {
+    display: flex; gap: 0; height: 68px; align-items: stretch;
+    background: var(--pending); border-radius: 2px; overflow: hidden;
+  }
+  @media (min-width: 620px) { .weave { height: 88px; } }
+  .strand { flex: 1 1 0; min-width: 0; background: transparent; }
+  .strand.filled { animation: land 420ms cubic-bezier(.2,.8,.3,1) both; }
+  @keyframes land {
+    from { transform: scaleY(.28); opacity: .35; }
+    to   { transform: scaleY(1);   opacity: 1; }
+  }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 14px; font-size: 13px; color: var(--ink-soft); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; }
+
+  /* ------------------------------------------------------------- headline */
+  .headline { padding: 26px 0 6px; }
+  .rate {
+    font-size: clamp(44px, 13vw, 74px); font-weight: 500;
+    letter-spacing: -0.035em; line-height: 0.95; margin: 0;
+  }
+  .rate small { font-size: 0.34em; font-weight: 500; letter-spacing: -0.01em; color: var(--ink-soft); margin-left: 0.25em; }
+  .sub { color: var(--ink-soft); margin: 8px 0 0; font-size: 14.5px; }
+  .name { color: var(--ink); font-weight: 500; overflow-wrap: anywhere; }
+
+  /* --------------------------------------------------------------- ledger */
+  .ledger { margin-top: 24px; border-top: 1px solid var(--rule); }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; padding: 15px 0; border-bottom: 1px solid var(--rule); align-items: baseline; }
+  .row .who { font-weight: 500; display: inline-flex; align-items: center; gap: 8px; }
+  .row .amt { color: var(--ink-soft); font-size: 14px; white-space: nowrap; }
+  .bar { grid-column: 1 / -1; height: 5px; background: var(--pending); border-radius: 99px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; border-radius: 99px; transition: width 400ms cubic-bezier(.2,.8,.3,1); }
+  .billed { font-size: 12.5px; color: var(--cost-1); font-weight: 500; }
+
+  /* ----------------------------------------------------------------- form */
+  form {
+    display: grid; gap: 8px; margin-top: 28px;
+    grid-template-columns: 1fr auto auto;
+  }
+  @media (max-width: 519px) {
+    form { grid-template-columns: 1fr 1fr; }
+    input[type=url] { grid-column: 1 / -1; }
+  }
+  input[type=url] {
+    min-width: 0; padding: 12px 14px;
+    background: var(--surface); color: var(--ink);
+    border: 1px solid var(--rule); border-radius: var(--radius);
+    font: inherit; font-size: 15px;
+  }
+  input[type=url]::placeholder { color: var(--ink-faint); }
+  button {
+    padding: 12px 18px; font: inherit; font-size: 15px; font-weight: 500;
+    background: var(--ink); color: var(--ground);
+    border: 1px solid var(--ink); border-radius: var(--radius); cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--ink); }
+  button:active { transform: translateY(1px); }
+  :focus-visible { outline: 2px solid var(--free-1); outline-offset: 2px; }
+
+  .empty { color: var(--ink-soft); padding: 30px 0 4px; max-width: 46ch; }
+  .note { margin-top: 12px; font-size: 13px; color: var(--ink-faint); min-height: 1.4em; }
+  .failed { color: var(--cost-2); font-weight: 500; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .strand.filled { animation: none; }
+    .bar > i { transition: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 class="wordmark">braid</h1>
+    <div class="uplinks" id="uplinks"></div>
+  </header>
+
+  <div class="weave-wrap">
+    <div class="weave" id="weave" role="img" aria-label="Transfer progress, coloured by which uplink fetched each part"></div>
+    <div class="legend" id="legend"></div>
+  </div>
+
+  <div class="headline">
+    <p class="rate" id="rate">—<small>Mbps</small></p>
+    <p class="sub" id="sub">Nothing streaming yet.</p>
+  </div>
+
+  <div class="ledger" id="ledger"></div>
+
+  <form id="form">
+    <input type="url" id="url" placeholder="Paste a link" required autocomplete="off" spellcheck="false">
+    <button type="submit">Stream</button>
+    <button type="button" class="ghost" id="copy">Copy link</button>
+  </form>
+  <p class="note" id="note"></p>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  // The page carries the same token it was opened with, so every request it
+  // makes — and every /stream link it hands you — stays authenticated.
+  var token = new URLSearchParams(location.search).get("t") || "";
+  var withToken = function (path) {
+    var u = new URL(path, location.origin);
+    if (token) u.searchParams.set("t", token);
+    return u.toString();
+  };
+
+  var FREE = ["--free-1", "--free-2", "--free-3"];
+  var COST = ["--cost-1", "--cost-2"];
+  var colours = {};
+
+  // Cool for free links, warm for metered ones. Assigned once per interface so
+  // a link keeps its colour across the weave, the legend and the ledger.
+  function assignColours(links) {
+    var f = 0, c = 0;
+    links.forEach(function (l) {
+      if (colours[l.iface]) return;
+      colours[l.iface] = l.metered ? COST[c++ % COST.length] : FREE[f++ % FREE.length];
+    });
+  }
+  function colourOf(iface) {
+    var v = colours[iface];
+    return v ? "var(" + v + ")" : "var(--ink-faint)";
+  }
+
+  function bytes(n) {
+    if (n === null || n === undefined) return "—";
+    if (n < 1024) return n + " B";
+    if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
+    return (n / 1073741824).toFixed(2) + " GB";
+  }
+  function secs(s) {
+    if (!isFinite(s) || s < 0) return "—";
+    if (s < 60) return Math.round(s) + "s";
+    var m = Math.floor(s / 60);
+    return m + "m" + String(Math.round(s % 60)).padStart(2, "0") + "s";
+  }
+
+  var weaveEl = document.getElementById("weave");
+  var drawn = [];   // what each cell currently shows, so only changes animate
+
+  // A transfer can have thousands of chunks but a phone has a few hundred
+  // pixels. Buckets keep one cell per visible column and colour it by whichever
+  // link owns most of that slice.
+  var MAX_CELLS = 220;
+  function bucket(owners) {
+    if (owners.length <= MAX_CELLS) return owners;
+    var out = [], per = owners.length / MAX_CELLS;
+    for (var i = 0; i < MAX_CELLS; i++) {
+      var tally = {}, best = "", bestN = 0;
+      for (var j = Math.floor(i * per); j < Math.floor((i + 1) * per); j++) {
+        var o = owners[j] || "";
+        if (!o) continue;
+        tally[o] = (tally[o] || 0) + 1;
+        if (tally[o] > bestN) { bestN = tally[o]; best = o; }
+      }
+      out.push(best);
+    }
+    return out;
+  }
+
+  function drawWeave(owners) {
+    var cells = bucket(owners);
+    if (weaveEl.childElementCount !== cells.length) {
+      weaveEl.textContent = "";
+      drawn = [];
+      var frag = document.createDocumentFragment();
+      for (var i = 0; i < cells.length; i++) {
+        var d = document.createElement("div");
+        d.className = "strand";
+        frag.appendChild(d);
+        drawn.push(null);
+      }
+      weaveEl.appendChild(frag);
+    }
+    for (var k = 0; k < cells.length; k++) {
+      if (drawn[k] === cells[k]) continue;
+      var el = weaveEl.children[k];
+      drawn[k] = cells[k];
+      if (!cells[k]) {
+        el.className = "strand";
+        el.style.background = "";
+        continue;
+      }
+      el.style.background = cells[k] === "resumed" ? "var(--ink-faint)" : colourOf(cells[k]);
+      // Re-trigger the entrance so the arrival is visible, not just a repaint.
+      el.classList.remove("filled");
+      void el.offsetWidth;
+      el.classList.add("filled");
+    }
+  }
+
+  function renderUplinks(links) {
+    var el = document.getElementById("uplinks");
+    el.textContent = "";
+    links.forEach(function (l) {
+      var d = document.createElement("span");
+      d.className = "dot";
+      d.style.background = colourOf(l.iface);
+      d.title = l.label + (l.metered ? " — metered" : "");
+      el.appendChild(d);
+    });
+    var t = document.createElement("span");
+    t.textContent = links.length === 1 ? "1 uplink" : links.length + " uplinks";
+    el.appendChild(t);
+  }
+
+  function renderLegend(links) {
+    var el = document.getElementById("legend");
+    el.textContent = "";
+    links.forEach(function (l) {
+      var s = document.createElement("span");
+      var sw = document.createElement("i");
+      sw.className = "swatch";
+      sw.style.background = colourOf(l.iface);
+      s.appendChild(sw);
+      s.appendChild(document.createTextNode(l.label + (l.metered ? " · billed" : "")));
+      el.appendChild(s);
+    });
+  }
+
+  function renderLedger(t, links) {
+    var el = document.getElementById("ledger");
+    el.textContent = "";
+    if (!t) return;
+
+    var counts = {};
+    t.owners.forEach(function (o) { if (o) counts[o] = (counts[o] || 0) + 1; });
+    var total = Object.keys(counts).reduce(function (a, k) { return a + counts[k]; }, 0);
+    if (!total) return;
+
+    links.concat([{ iface: "resumed", label: "Already on disk", metered: false }])
+      .filter(function (l) { return counts[l.iface]; })
+      .sort(function (a, b) { return counts[b.iface] - counts[a.iface]; })
+      .forEach(function (l) {
+        var share = counts[l.iface] / total;
+        var row = document.createElement("div");
+        row.className = "row";
+
+        var who = document.createElement("div");
+        who.className = "who";
+        var sw = document.createElement("i");
+        sw.className = "swatch";
+        sw.style.background = l.iface === "resumed" ? "var(--ink-faint)" : colourOf(l.iface);
+        who.appendChild(sw);
+        who.appendChild(document.createTextNode(l.label));
+        if (l.metered) {
+          var b = document.createElement("span");
+          b.className = "billed";
+          b.textContent = bytes(Math.round(share * t.bytes)) + " billed";
+          who.appendChild(b);
+        }
+
+        var amt = document.createElement("div");
+        amt.className = "amt";
+        amt.textContent = Math.round(share * 100) + "%  ·  " + bytes(Math.round(share * t.bytes));
+
+        var bar = document.createElement("div");
+        bar.className = "bar";
+        var fill = document.createElement("i");
+        fill.style.width = (share * 100).toFixed(1) + "%";
+        fill.style.background = l.iface === "resumed" ? "var(--ink-faint)" : colourOf(l.iface);
+        bar.appendChild(fill);
+
+        row.appendChild(who);
+        row.appendChild(amt);
+        row.appendChild(bar);
+        el.appendChild(row);
+      });
+  }
+
+  function render(snap) {
+    var links = snap.links || [];
+    assignColours(links);
+    renderUplinks(links);
+    renderLegend(links);
+
+    var list = snap.transfers || [];
+    var t = list.length ? list[list.length - 1] : null;
+
+    var rate = document.getElementById("rate");
+    var sub = document.getElementById("sub");
+
+    if (!t) {
+      drawWeave([]);
+      rate.innerHTML = '—<small>Mbps</small>';
+      sub.className = "sub";
+      sub.textContent = links.length > 1
+        ? "Paste a link and braid will pull it over every uplink at once."
+        : "Only one uplink, so there is nothing to bond yet. Tether a phone over USB, or plug in Ethernet.";
+      renderLedger(null, links);
+      return;
+    }
+
+    drawWeave(t.owners || []);
+
+    if (t.cached) {
+      // Nothing was fetched, so a throughput number would be meaningless — and
+      // a giant em dash reads as breakage rather than as "not applicable".
+      rate.innerHTML = escapeHTML(bytes(t.size)) + '<small>cached</small>';
+    } else {
+      rate.innerHTML = (t.mbps ? t.mbps.toFixed(1) : "0.0") + '<small>Mbps</small>';
+    }
+
+    if (t.cached) {
+      sub.className = "sub";
+      sub.innerHTML = '<span class="name">' + escapeHTML(t.name) +
+        "</span> — already on disk, so nothing was downloaded again.";
+    } else if (t.failed) {
+      sub.className = "sub failed";
+      sub.textContent = t.failed;
+    } else {
+      sub.className = "sub";
+      var done = bytes(t.bytes) + " of " + bytes(t.size);
+      var tail = t.finished ? "finished in " + secs(t.seconds) : secs(t.seconds) + " elapsed";
+      sub.innerHTML = '<span class="name">' + escapeHTML(t.name) + "</span> — " + done + " · " + tail;
+    }
+    renderLedger(t, links);
+  }
+
+  function escapeHTML(s) {
+    var d = document.createElement("div");
+    d.textContent = s || "";
+    return d.innerHTML;
+  }
+
+  var note = document.getElementById("note");
+
+  document.getElementById("form").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var raw = document.getElementById("url").value.trim();
+    if (!raw) return;
+    location.href = withToken("/stream?url=" + encodeURIComponent(raw));
+  });
+
+  document.getElementById("copy").addEventListener("click", function () {
+    var raw = document.getElementById("url").value.trim();
+    if (!raw) { note.textContent = "Paste a link first."; return; }
+    var link = withToken("/stream?url=" + encodeURIComponent(raw));
+    var say = function (msg) { note.textContent = msg; };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(link).then(
+        function () { say("Copied. Open it in VLC, Infuse, or any browser on your network."); },
+        function () { say(link); }
+      );
+    } else {
+      say(link);
+    }
+  });
+
+  var es = new EventSource(withToken("/api/events"));
+  es.onmessage = function (ev) {
+    try { render(JSON.parse(ev.data)); } catch (e) { /* a malformed frame is not worth a blank page */ }
+  };
+  es.onerror = function () {
+    note.textContent = "Lost contact with braid. Reconnecting…";
+  };
+  es.addEventListener("open", function () {
+    if (note.textContent.indexOf("Lost contact") === 0) note.textContent = "";
+  });
+})();
+</script>
+</body>
+</html>

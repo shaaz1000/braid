@@ -79,10 +79,26 @@ func (l Link) Families() []Family {
 
 // Label is the name to show a human.
 func (l Link) Label() string {
-	if l.Friendly != "" {
-		return l.Friendly
+	if tidy := collapseRepeats(l.Friendly); tidy != "" {
+		return tidy
 	}
 	return l.Iface
+}
+
+// collapseRepeats drops a word that merely repeats the one before it. macOS
+// created a service literally named "iPhone USB USB" after re-enumerating the
+// phone; that is the OS stuttering, not a name, and it should not be what
+// someone reads on a dashboard.
+func collapseRepeats(name string) string {
+	words := strings.Fields(name)
+	out := make([]string, 0, len(words))
+	for _, w := range words {
+		if len(out) > 0 && strings.EqualFold(out[len(out)-1], w) {
+			continue
+		}
+		out = append(out, w)
+	}
+	return strings.Join(out, " ")
 }
 
 // skipPrefixes never carry an uplink: loopback, tunnels, Thunderbolt bridges,

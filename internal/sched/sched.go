@@ -238,18 +238,29 @@ func runWorker(ctx context.Context, cfg Config, q *queue, l Link, mu *sync.Mutex
 			continue
 		}
 
-		// Claim the chunk before writing. Under tail stealing two workers hold
-		// the same range; the bitmap decides which one owns it, so the loser
-		// discards its buffer instead of repeating the write.
-		if !cfg.Bits.Set(idx) {
+		// Under tail stealing two workers hold the same range, so skip the work
+		// if the other one already finished it.
+		if cfg.Bits.Get(idx) {
 			q.release(idx)
 			continue
 		}
+		// Write BEFORE publishing. The bitmap is a promise that these bytes are
+		// on disk: a reader serving the file in order wakes on Set and reads
+		// whatever is at that offset, so setting the bit first would hand it
+		// zeros. Publishing early was invisible to a plain download, where
+		// nothing reads concurrently, and corrupts every streamed response.
 		if _, err := cfg.Out.WriteAt(body, start); err != nil {
 			// The bytes are good but the disk refused them. This is not
 			// retryable on another link.
 			q.abort(fmt.Errorf("writing chunk %d at offset %d: %w", idx, start, err))
 			return
+		}
+		if !cfg.Bits.Set(idx) {
+			// A tail-steal rival published first. Its bytes are identical to
+			// ours, so the duplicate write was harmless — but the chunk is not
+			// ours to count.
+			q.release(idx)
+			continue
 		}
 
 		// Progress is reported while the lock is held, which serialises delivery

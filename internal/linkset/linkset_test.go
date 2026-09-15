@@ -179,3 +179,24 @@ func TestLinkLabelPrefersFriendlyName(t *testing.T) {
 		t.Errorf("Label() = %q, want en0", got)
 	}
 }
+
+func TestLabelCollapsesRepeatedWords(t *testing.T) {
+	// macOS created a service literally named "iPhone USB USB" after
+	// re-enumerating the phone. That is the OS stuttering, not a name, and it
+	// should not be what a person reads on a dashboard.
+	cases := map[string]string{
+		"iPhone USB USB":     "iPhone USB",
+		"iPhone USB USB USB": "iPhone USB",
+		"Wi-Fi":              "Wi-Fi",
+		"USB 10/100 LAN":     "USB 10/100 LAN",
+		"Thunderbolt Bridge": "Thunderbolt Bridge",
+		"usb USB":            "usb",
+	}
+	for in, want := range cases {
+		t.Run(in, func(t *testing.T) {
+			if got := (Link{Iface: "en5", Friendly: in}).Label(); got != want {
+				t.Errorf("Label(%q) = %q, want %q", in, got, want)
+			}
+		})
+	}
+}

@@ -7,8 +7,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -16,6 +18,7 @@ import (
 
 	"braid/internal/human"
 	"braid/internal/linkset"
+	"braid/internal/server"
 	"braid/internal/xfer"
 )
 
@@ -24,6 +27,7 @@ const usage = `braid — one download, every uplink at once.
 usage:
   braid links                 show the uplinks braid can use
   braid get [flags] <url>     download a file over all of them
+  braid serve [flags]         share the bonded speed with every device here
 
 get flags:
   -o <path>       output directory or file path (default: current directory)
@@ -31,6 +35,11 @@ get flags:
   -workers <n>    concurrent fetches per link (default 4)
   -tail-steal     re-request a stalled chunk on an idle link near the end;
                   costs duplicate bytes on a metered link, so it is off by default
+
+serve flags:
+  -port <n>       port to listen on (default 8080)
+  -cache <dir>    where streamed files are kept (default ~/.braid/cache)
+  -token <s>      shared secret; one is generated and printed if omitted
 `
 
 func main() {
@@ -45,6 +54,8 @@ func main() {
 		err = cmdLinks()
 	case "get":
 		err = cmdGet(os.Args[2:])
+	case "serve":
+		err = cmdServe(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -260,4 +271,96 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func cmdServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	port := fs.Int("port", 8080, "port to listen on")
+	cache := fs.String("cache", "", "where streamed files are kept")
+	token := fs.String("token", "", "shared secret")
+	chunk := fs.Int64("chunk", 0, "chunk size in bytes")
+	workers := fs.Int("workers", 0, "concurrent fetches per link")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *cache == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		*cache = filepath.Join(home, ".braid", "cache")
+	}
+	if err := os.MkdirAll(*cache, 0o755); err != nil {
+		return fmt.Errorf("preparing the cache directory: %w", err)
+	}
+	generated := *token == ""
+	if generated {
+		*token = server.NewToken()
+	}
+
+	srv, err := server.New(server.Options{
+		Token:          *token,
+		CacheDir:       *cache,
+		Links:          discover2,
+		ChunkSize:      *chunk,
+		WorkersPerLink: *workers,
+		ChunkTimeout:   20 * time.Second,
+	})
+	if err != nil {
+		return err
+	}
+	defer srv.Close()
+
+	// Bound to every interface on purpose: a phone cannot reach a daemon that
+	// only listens on localhost. That exposure is why the token is mandatory.
+	httpSrv := &http.Server{Addr: fmt.Sprintf(":%d", *port), Handler: srv}
+
+	links, err := discover()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("braid is sharing %d uplink(s) on port %d\n\n", len(links), *port)
+	for _, l := range links {
+		if a, ok := l.Addr(linkset.Fam4); ok {
+			fmt.Printf("  http://%s:%d/?t=%s\n", a, *port, *token)
+		}
+	}
+	fmt.Printf("\nOpen one of those on any device here. To play something in VLC or\n")
+	fmt.Printf("Infuse, paste a link into the page and use \"Copy link\".\n")
+	if generated {
+		fmt.Printf("\nThis token is new each run. Pass -token to keep one.\n")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errs := make(chan error, 1)
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errs <- err
+		}
+	}()
+
+	select {
+	case err := <-errs:
+		return err
+	case <-ctx.Done():
+		fmt.Println("\nstopping")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return httpSrv.Shutdown(shutdownCtx)
+	}
+}
+
+// discover2 adapts discover to the signature the server wants, swallowing the
+// error: a momentarily empty link list is normal when a phone is unplugged, and
+// must not take the daemon down.
+func discover2() []linkset.Link {
+	links, err := discover()
+	if err != nil {
+		return nil
+	}
+	return links
 }

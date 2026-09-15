@@ -230,6 +230,11 @@ func (t *Transfer) ReaderAt() io.ReaderAt { return t.file }
 // Close releases the output file. It does not delete anything.
 func (t *Transfer) Close() error { return t.file.Close() }
 
+// Sync flushes the output file. Get does this itself; a caller that only
+// streams a transfer must call it once the fetch completes, or a crash can
+// lose bytes the bitmap claims are on disk.
+func (t *Transfer) Sync() error { return t.file.Sync() }
+
 func (t *Transfer) saveSidecar() {
 	t.state.Bits = t.Bits.Bytes()
 	_ = plan.Save(t.sidecar, t.state)
