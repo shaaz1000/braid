@@ -357,8 +357,10 @@ func TestTailStealingRescuesAWedgedChunk(t *testing.T) {
 	}
 }
 
-func TestTailStealingIsOffByDefault(t *testing.T) {
-	// It costs duplicate bytes on a metered link, so it must be opt-in.
+func TestNothingIsStolenWhenEveryLinkIsHealthy(t *testing.T) {
+	// Rescuing is always available now, but it is arithmetic: it only happens
+	// when refetching would beat waiting. With healthy links nothing should be
+	// duplicated, because duplicated bytes on a metered link cost money.
 	data := source(300)
 	p := plan.New(int64(len(data)), 100)
 	out := newSink(len(data))
@@ -624,5 +626,50 @@ func TestASingleSlowLinkIsStillUsedWhenItIsAllThereIs(t *testing.T) {
 	}
 	if !bytes.Equal(out.bytes(), data) {
 		t.Error("output does not match the source")
+	}
+}
+
+func TestRescueHappensAsSoonAsRefetchingBeatsWaiting(t *testing.T) {
+	// A fixed rescue delay is a guess. With Wi-Fi at 102 Mbps beside cellular
+	// at 7, waiting three seconds before rescuing wastes almost all of the
+	// three seconds: the fast link could have refetched the whole block in a
+	// fraction of that.
+	//
+	// The rule should be arithmetic, not a timer: steal when refetching would
+	// finish sooner than waiting for the current holder.
+	data := source(500)
+	p := plan.New(int64(len(data)), 100) // 5 chunks
+	out := newSink(len(data))
+
+	fast := &fakeLink{data: data}
+	crawling := &fakeLink{data: data, delay: 4 * time.Second}
+
+	cfg := fastOpts(p, plan.NewBitmap(p.Chunks), out,
+		Link{Name: "fast", Fetcher: fast, Workers: 1},
+		Link{Name: "crawling", Fetcher: crawling, Workers: 1},
+	)
+	// Deliberately NOT setting TailStealAfter: the scheduler should work this
+	// out from observed rates rather than being told a delay.
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	res, err := Run(ctx, cfg)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !bytes.Equal(out.bytes(), data) {
+		t.Fatal("output does not match the source")
+	}
+	// The fast link needs milliseconds for all five chunks. Anything close to
+	// the slow link's four seconds means we waited instead of deciding.
+	if elapsed > 900*time.Millisecond {
+		t.Errorf("took %v; the rescue is still waiting on a timer rather than "+
+			"comparing refetch against wait", elapsed)
+	}
+	if res.TailSteals == 0 {
+		t.Error("nothing was rescued")
 	}
 }

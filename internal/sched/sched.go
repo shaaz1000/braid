@@ -61,9 +61,10 @@ type Config struct {
 	// ChunkTimeout bounds any single fetch, so a connection that stays open
 	// but silent is abandoned rather than holding a chunk forever.
 	ChunkTimeout time.Duration
-	// TailStealAfter enables endgame tail stealing: once the queue is empty, an
-	// idle worker may re-request a chunk that has been in flight this long.
-	// Zero disables it, because duplicate bytes cost money on a metered link.
+	// TailStealAfter is a minimum wait before a chunk may be rescued, not a
+	// switch. Rescuing is always available and decided by arithmetic: an idle
+	// worker re-requests a chunk only when refetching would finish sooner than
+	// waiting for its current holder. Zero means no minimum.
 	TailStealAfter time.Duration
 	// LinkFailureLimit retires a link after this many consecutive failures.
 	LinkFailureLimit int
@@ -84,6 +85,9 @@ type Result struct {
 const (
 	defaultMaxAttempts      = 5
 	defaultLinkFailureLimit = 6
+	// minUnmeasuredWait keeps a healthy link from being robbed the instant it
+	// picks up its first chunk, before it has had a chance to report a rate.
+	minUnmeasuredWait = 250 * time.Millisecond
 )
 
 func defaultBackoff(attempt int) time.Duration {
@@ -133,8 +137,12 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	// Tail stealing decides on elapsed time, so waiters need waking
 	// periodically to re-evaluate how long a chunk has been in flight.
-	if cfg.TailStealAfter > 0 {
-		ticker := time.NewTicker(cfg.TailStealAfter / 2)
+	{
+		wake := cfg.TailStealAfter / 2
+		if wake <= 0 {
+			wake = 120 * time.Millisecond
+		}
+		ticker := time.NewTicker(wake)
 		defer ticker.Stop()
 		go func() {
 			for {
@@ -297,9 +305,14 @@ type queue struct {
 	mu   sync.Mutex
 	cond *sync.Cond
 
+	plan     plan.Plan
 	pending  []int
 	inflight map[int]time.Time
+	holder   map[int]string
 	stolen   map[int]bool
+	// rates is each link's observed throughput in bytes per second, which is
+	// what turns rescuing from a guessed delay into arithmetic.
+	rates map[string]float64
 
 	attempts  map[chunkLink]int
 	linkFails map[string]int
@@ -314,7 +327,10 @@ type queue struct {
 
 func newQueue(cfg Config) *queue {
 	q := &queue{
+		plan:             cfg.Plan,
 		inflight:         map[int]time.Time{},
+		holder:           map[int]string{},
+		rates:            map[string]float64{},
 		stolen:           map[int]bool{},
 		attempts:         map[chunkLink]int{},
 		linkFails:        map[string]int{},
@@ -370,10 +386,8 @@ func (q *queue) next(link string, tailStealAfter time.Duration) (int, bool) {
 
 		// Endgame: the queue is drained and this worker is idle while someone
 		// else is still labouring over a chunk.
-		if tailStealAfter > 0 {
-			if idx, ok := q.takeStealFor(link, tailStealAfter); ok {
-				return idx, true
-			}
+		if idx, ok := q.takeStealFor(link, tailStealAfter); ok {
+			return idx, true
 		}
 
 		q.cond.Wait()
@@ -385,26 +399,68 @@ func (q *queue) takePendingFor(link string) (int, bool) {
 		if q.attempts[chunkLink{idx, link}] < q.maxAttempts {
 			q.pending = append(q.pending[:i], q.pending[i+1:]...)
 			q.inflight[idx] = time.Now()
+			q.holder[idx] = link
 			return idx, true
 		}
 	}
 	return 0, false
 }
 
-func (q *queue) takeStealFor(link string, after time.Duration) (int, bool) {
+// takeStealFor decides whether this worker should re-request a chunk someone
+// else is still labouring over.
+//
+// The rule is arithmetic rather than a timer: steal when refetching the chunk
+// would finish sooner than waiting for its current holder. A fixed delay is a
+// guess, and a bad one — with Wi-Fi at 102 Mbps beside cellular at 7, waiting
+// three seconds throws away nearly all three, because the fast link could have
+// refetched the whole block in a fraction of that.
+func (q *queue) takeStealFor(link string, floor time.Duration) (int, bool) {
 	now := time.Now()
+	mine := q.rates[link]
+
 	for idx, started := range q.inflight {
-		if q.stolen[idx] || now.Sub(started) < after {
+		held := q.holder[idx]
+		if q.stolen[idx] || held == link {
 			continue
 		}
 		if q.attempts[chunkLink{idx, link}] >= q.maxAttempts {
 			continue
 		}
-		// One steal per chunk. A crowd of workers re-requesting the same bytes
-		// would multiply cost without improving the outcome.
-		q.stolen[idx] = true
-		q.tailSteals++
-		return idx, true
+
+		elapsed := now.Sub(started)
+		if elapsed < floor {
+			continue
+		}
+		size := float64(q.plan.Len(idx))
+
+		// How long would I take?
+		refetch := time.Duration(0)
+		if mine > 0 {
+			refetch = time.Duration(size / mine * float64(time.Second))
+		}
+
+		// How much longer is the holder likely to need?
+		var remaining time.Duration
+		if theirs := q.rates[held]; theirs > 0 {
+			total := time.Duration(size / theirs * float64(time.Second))
+			remaining = total - elapsed
+		} else {
+			// No measurement for the holder yet: it has not finished a single
+			// chunk. Judge it by how long it has already been trying compared
+			// with what the job would cost me.
+			if elapsed < 3*refetch || elapsed < minUnmeasuredWait {
+				continue
+			}
+			remaining = elapsed // assume at least as long again
+		}
+
+		// Only worth it with a clear margin, or a near-tie causes churn.
+		if remaining > refetch*2 {
+			q.stolen[idx] = true
+			q.tailSteals++
+			q.inflight[idx] = now
+			return idx, true
+		}
 	}
 	return 0, false
 }
@@ -413,7 +469,21 @@ func (q *queue) takeStealFor(link string, after time.Duration) (int, bool) {
 func (q *queue) completed(idx int, link string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	// Observed throughput for this link, smoothed. This is what lets the
+	// rescue decision be arithmetic.
+	if started, ok := q.inflight[idx]; ok {
+		if secs := time.Since(started).Seconds(); secs > 0 {
+			observed := float64(q.plan.Len(idx)) / secs
+			if prev := q.rates[link]; prev > 0 {
+				q.rates[link] = prev*0.6 + observed*0.4
+			} else {
+				q.rates[link] = observed
+			}
+		}
+	}
 	delete(q.inflight, idx)
+	delete(q.holder, idx)
 	q.linkFails[link] = 0
 	if q.remaining > 0 {
 		q.remaining--
@@ -427,6 +497,7 @@ func (q *queue) release(idx int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	delete(q.inflight, idx)
+	delete(q.holder, idx)
 	q.cond.Broadcast()
 }
 
