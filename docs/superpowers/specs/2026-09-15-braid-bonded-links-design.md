@@ -390,3 +390,45 @@ against.
 `IP_BOUND_IF` genuinely pins across *two* links. With a single uplink the check
 passes trivially, since there is nowhere else for traffic to go, so it proves
 the harness works and nothing about the premise.
+
+**2026-09-15, cellular measured (Wi-Fi radio joined to the iPhone's 5G hotspot,
+`en0` = 172.20.10.3).**
+
+| Link | IPv4 | IPv6 |
+|---|---|---|
+| 5G cellular | **112.8 Mbps** (107.6 MB / 8 s) | 70.3 Mbps |
+| Home Wi-Fi | 100.0 Mbps | 95.6 Mbps |
+
+Consequences:
+
+- **The two links are near-equal, with cellular slightly ahead.** Projected
+  aggregate is ~210 Mbps, roughly double — the ideal bonding case, and much
+  better than the +30–80% predicted when cellular was assumed to be the weak
+  link. This is a projection from two independent measurements, not yet an
+  observed aggregate.
+- **Cellular is dual-stack**, holding a global `2001:db8:2:…` address.
+  Risk #3 (cellular being IPv6-only and unable to reach v4-only origins) is
+  retired.
+- **Family choice matters per link.** IPv6 costs 37% on cellular (70.3 vs 112.8)
+  but is near-parity on Wi-Fi (95.6 vs 100.0). `linkset` must therefore track
+  an EWMA rate *per link per family*, and `sched` must pick each link's faster
+  family independently rather than choosing one family globally.
+- Range requests behave identically over cellular: 206 from both
+  `dl.google.com` and `cdn.jsdelivr.net`.
+
+**USB tethering is not required after all.** At 113 Mbps, cellular sits well
+under the ~250 Mbps USB 2.0 ceiling, so the earlier worry that USB would
+throttle 5G does not apply. Either topology works:
+
+| Topology | Broadband | Cellular | Blocker |
+|---|---|---|---|
+| A | Wi-Fi `en0` ~100 | iPhone USB ~113 | USB link is intermittent — `en5`/`en14` appeared and vanished repeatedly, DHCP never answered |
+| B | USB 10/100 LAN `en12` → router, ~94 | Wi-Fi `en0` → hotspot, 113 | Needs the adapter plugged in and an Ethernet run to the router |
+
+Topology B is currently the shorter path, since the Wi-Fi half is already
+proven working and the USB tether half is not.
+
+**Still open:** the premise itself. Every measurement so far has been taken with
+exactly one uplink, where pinning passes trivially because there is nowhere else
+for traffic to go. `IP_BOUND_IF` has still never been tested against two
+simultaneous links, which is the only thing Phase 0 exists to prove.
