@@ -432,3 +432,50 @@ proven working and the USB tether half is not.
 exactly one uplink, where pinning passes trivially because there is nowhere else
 for traffic to go. `IP_BOUND_IF` has still never been tested against two
 simultaneous links, which is the only thing Phase 0 exists to prove.
+
+### Phase 0 verdict: PASSED
+
+**2026-09-15, two live uplinks at last** — Wi-Fi `en0` on the home line
+(192.168.1.42) and the iPhone tethered over USB on `en5` (172.20.10.2), after a
+third cable finally held. The first two produced interfaces that appeared and
+vanished with DHCP never answering; a worn data cable, not a configuration
+fault.
+
+| Measurement | Result |
+|---|---|
+| Wi-Fi alone, IPv4 / IPv6 | 84.6 / **94.1** Mbps |
+| iPhone USB alone, IPv4 | **107.3** Mbps (no IPv6 offered at all) |
+| **Both concurrently** | Wi-Fi 92.5 + cellular 82.1 = **174.6 Mbps** |
+| Best single link | 107.3 Mbps → **gain +63%** |
+| Theoretical ceiling (sum of each link's best family) | 201.4 Mbps → **87% captured** |
+| Kernel counters during the concurrent run | **142.2 MB on `en0`, 125.8 MB on `en5`** |
+
+**`IP_BOUND_IF` works.** That last row is the proof the entire project rests on:
+substantial traffic moved on both interfaces at once while the routing table's
+default route pointed at only one of them. Verified at the interface, not
+inferred from a `setsockopt` return value. Risk #1 is retired and the premise is
+sound.
+
+Further findings, each with a design consequence:
+
+- **The links are not perfectly independent.** Cellular fell from 107.3 to
+  82.1 Mbps under concurrency (−24%) while Wi-Fi barely moved (94.1 → 92.5).
+  Cause unconfirmed — USB 2.0 contention or ordinary cellular variance. The
+  scheduler must therefore weight links on *continuously observed* throughput
+  during the transfer, never on a rate measured in isolation beforehand.
+- **A link's faster family changes between runs.** Wi-Fi favoured IPv4 in the
+  first run (100.0 vs 95.6) and IPv6 in this one (94.1 vs 84.6). Per-link
+  per-family EWMA is load-bearing, not a refinement.
+- **USB tethering offers no IPv6 whatsoever**, while the *same phone's* Wi-Fi
+  hotspot handed out a global `2001:db8:2:…`. Family availability is a
+  property of the tethering method, not the carrier — so `dial` must error on a
+  missing family rather than assume dual-stack.
+- **USB 2.0 is not the bottleneck at these speeds.** USB tether measured
+  107.3 Mbps against 112.8 for the same phone over Wi-Fi hotspot — close enough
+  that the earlier worry about USB throttling 5G is unfounded below ~250 Mbps.
+- **macOS link names are not presentable.** The OS named this service
+  `iPhone USB USB`, having created a duplicate when the phone re-enumerated.
+  This is why user-facing rename/recolour is a real feature, not polish.
+- **Interface churn is real.** Across this session `en5`, `en6` and `en14` each
+  appeared and vanished, and macOS spawned duplicate services. The hot-plug
+  requirement in `linkset` is fully justified.
