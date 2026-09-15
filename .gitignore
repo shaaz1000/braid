@@ -1,4 +1,5 @@
 /braid
 /dist/
+/spike/spike
 *.braid
 .DS_Store
