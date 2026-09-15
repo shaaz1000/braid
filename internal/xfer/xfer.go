@@ -1,5 +1,9 @@
 // Package xfer performs one bonded transfer end to end: probe the URL, decide
 // how to divide it, honour any resumable progress, and drive the scheduler.
+//
+// Two entry points. Get downloads to disk and returns when finished. Start
+// returns a handle to a transfer that is still filling, so a caller can serve
+// the bytes in order while the links are still fetching them.
 package xfer
 
 import (
@@ -10,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"braid/internal/dial"
@@ -32,6 +37,7 @@ var ErrRangeIgnored = errors.New("server answered 206 but ignored the byte range
 const (
 	defaultWorkersPerLink = 4
 	probeTimeout          = 30 * time.Second
+	streamBufSize         = 256 << 10
 )
 
 // Dialer builds a transport pinned to one link and family. Injectable so the
@@ -73,10 +79,266 @@ type linkClient struct {
 	client *http.Client
 }
 
-// Get downloads o.URL, splitting it across every link when the server permits.
+// Transfer is a download that has started and may still be filling.
+//
+// Plan and Bits together say which bytes are already on disk, which is what a
+// reader needs to serve the file in order while chunks arrive out of order.
+type Transfer struct {
+	Info    probe.Result
+	Plan    plan.Plan
+	Bits    *plan.Bitmap
+	Path    string
+	Resumed bool
+
+	opts    Options
+	clients []linkClient
+	file    *os.File
+	sidecar string
+	state   plan.State
+
+	done chan struct{}
+	mu   sync.Mutex
+	res  sched.Result
+	err  error
+}
+
+// Start probes the URL, prepares the output file, and begins fetching in the
+// background. The returned Transfer may be read through immediately.
+func Start(ctx context.Context, o Options) (*Transfer, error) {
+	o, clients, err := prepare(o)
+	if err != nil {
+		return nil, err
+	}
+
+	probeCtx, cancelProbe := context.WithTimeout(ctx, probeTimeout)
+	defer cancelProbe()
+	info, err := probe.Do(probeCtx, clients[0].client, o.URL)
+	if err != nil {
+		return nil, fmt.Errorf("probing %s: %w", o.URL, err)
+	}
+
+	path, err := destPath(o.Dest, info.Filename)
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	// Size the file up front so every chunk can be written at its true offset.
+	// It stays sparse until the bytes arrive, so this costs nothing.
+	if err := f.Truncate(info.Size); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("sizing %s: %w", path, err)
+	}
+
+	t := &Transfer{
+		Info:    info,
+		Plan:    plan.New(info.Size, o.ChunkSize),
+		Path:    path,
+		opts:    o,
+		clients: clients,
+		file:    f,
+		sidecar: path + sidecarExt,
+		done:    make(chan struct{}),
+	}
+	t.state = plan.State{
+		URL:          info.URL,
+		Filename:     info.Filename,
+		Size:         info.Size,
+		ChunkSize:    t.Plan.ChunkSize,
+		ETag:         info.ETag,
+		LastModified: info.LastModified,
+	}
+
+	t.Bits = plan.NewBitmap(t.Plan.Chunks)
+	if saved, err := plan.Load(t.sidecar); err == nil && saved.Resumable(t.state) {
+		t.Bits = plan.BitmapFromBytes(t.Plan.Chunks, saved.Bits)
+		t.Resumed = true
+	} else {
+		// Either there is no saved progress or it belongs to a different file.
+		// Refusing to reuse it is the point: resuming across a changed remote
+		// file would silently stitch two files together.
+		os.Remove(t.sidecar)
+	}
+
+	go t.fill(ctx)
+	return t, nil
+}
+
+// fill runs the transfer to completion and publishes the outcome.
+func (t *Transfer) fill(ctx context.Context) {
+	defer close(t.done)
+
+	if !t.Info.Ranges {
+		// Nothing to split. One sequential stream, but chunks are still marked
+		// as the write passes each boundary, so a reader gets bytes as they
+		// arrive rather than all at the end.
+		n, err := t.single(ctx)
+		t.publish(sched.Result{Bytes: n, ByLink: map[string]int{t.clients[0].link.Iface: 1}}, err)
+		return
+	}
+
+	res, err := sched.Run(ctx, sched.Config{
+		Plan:           t.Plan,
+		Bits:           t.Bits,
+		Out:            t.file,
+		Links:          schedLinks(t.clients, t.Info.URL, t.opts.WorkersPerLink),
+		TailStealAfter: t.opts.TailStealAfter,
+		ChunkTimeout:   t.opts.ChunkTimeout,
+		OnProgress: func(pr sched.Progress) {
+			// Persisted as chunks land, so an interrupted transfer resumes from
+			// where it actually got to.
+			t.saveSidecar()
+			if t.opts.OnProgress != nil {
+				t.opts.OnProgress(pr.DoneChunks, pr.TotalChunks, pr.Bytes, pr.Link)
+			}
+		},
+	})
+	t.publish(res, err)
+}
+
+func (t *Transfer) publish(res sched.Result, err error) {
+	t.mu.Lock()
+	t.res, t.err = res, err
+	t.mu.Unlock()
+}
+
+// Wait blocks until the transfer finishes and reports what happened.
+func (t *Transfer) Wait() (sched.Result, error) {
+	<-t.done
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.res, t.err
+}
+
+// Done reports whether the transfer has finished, without blocking.
+func (t *Transfer) Done() bool {
+	select {
+	case <-t.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// ReaderAt reads the bytes already on disk. Pair it with Bits so nothing reads
+// a hole.
+func (t *Transfer) ReaderAt() io.ReaderAt { return t.file }
+
+// Close releases the output file. It does not delete anything.
+func (t *Transfer) Close() error { return t.file.Close() }
+
+func (t *Transfer) saveSidecar() {
+	t.state.Bits = t.Bits.Bytes()
+	_ = plan.Save(t.sidecar, t.state)
+}
+
+// single fetches an unsplittable URL sequentially, marking chunks complete as
+// the write passes each boundary so a reader can follow along.
+func (t *Transfer) single(ctx context.Context) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.Info.URL, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := t.clients[0].client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("single-stream GET returned HTTP %d", resp.StatusCode)
+	}
+
+	var written int64
+	nextChunk := 0
+	buf := make([]byte, streamBufSize)
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, err := t.file.WriteAt(buf[:n], written); err != nil {
+				return written, err
+			}
+			written += int64(n)
+			for nextChunk < t.Plan.Chunks {
+				_, end := t.Plan.Range(nextChunk)
+				if written <= end {
+					break
+				}
+				t.Bits.Set(nextChunk)
+				if t.opts.OnProgress != nil {
+					t.opts.OnProgress(t.Bits.Done(), t.Plan.Chunks, written, t.clients[0].link.Iface)
+				}
+				nextChunk++
+			}
+		}
+		if readErr == io.EOF {
+			return written, nil
+		}
+		if readErr != nil {
+			return written, readErr
+		}
+	}
+}
+
+// Get downloads o.URL, splitting it across every link when the server permits,
+// and returns when the file is complete on disk.
 func Get(ctx context.Context, o Options) (Outcome, error) {
+	t, err := Start(ctx, o)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer t.Close()
+
+	out := Outcome{Path: t.Path, Size: t.Info.Size, Ranges: t.Info.Ranges, Resumed: t.Resumed}
+	res, runErr := t.Wait()
+	out.Result = res
+
+	if errors.Is(runErr, ErrRangeIgnored) {
+		// The server promised slices and sent whole bodies. Nothing fetched so
+		// far can be trusted, so discard it and take the one path that yields a
+		// correct file.
+		os.Remove(t.sidecar)
+		out.Ranges, out.Resumed = false, false
+		n, err := t.single(ctx)
+		if err != nil {
+			return out, err
+		}
+		return t.finishUnsplittable(out, n)
+	}
+	if runErr != nil {
+		t.saveSidecar() // keep it: this is what makes the next attempt cheap
+		return out, runErr
+	}
+
+	if !t.Info.Ranges {
+		// A server that ignores ranges often misreports its length too, so the
+		// file is sized to what actually arrived.
+		return t.finishUnsplittable(out, res.Bytes)
+	}
+	if err := t.file.Sync(); err != nil {
+		return out, err
+	}
+	os.Remove(t.sidecar)
+	return out, nil
+}
+
+func (t *Transfer) finishUnsplittable(out Outcome, written int64) (Outcome, error) {
+	if err := t.file.Truncate(written); err != nil {
+		return out, fmt.Errorf("resizing %s to the %d bytes received: %w", t.Path, written, err)
+	}
+	out.Size = written
+	out.Ranges = false
+	out.Result = sched.Result{Bytes: written, ByLink: map[string]int{t.clients[0].link.Iface: 1}}
+	os.Remove(t.sidecar)
+	return out, t.file.Sync()
+}
+
+// prepare applies defaults and builds one pinned client per link.
+func prepare(o Options) (Options, []linkClient, error) {
 	if len(o.Links) == 0 {
-		return Outcome{}, errors.New("no usable link to download over")
+		return o, nil, errors.New("no usable link to download over")
 	}
 	if o.Dialer == nil {
 		o.Dialer = dial.Transport
@@ -87,105 +349,8 @@ func Get(ctx context.Context, o Options) (Outcome, error) {
 	if o.WorkersPerLink <= 0 {
 		o.WorkersPerLink = defaultWorkersPerLink
 	}
-
 	clients, err := buildClients(o)
-	if err != nil {
-		return Outcome{}, err
-	}
-
-	probeCtx, cancelProbe := context.WithTimeout(ctx, probeTimeout)
-	defer cancelProbe()
-	info, err := probe.Do(probeCtx, clients[0].client, o.URL)
-	if err != nil {
-		return Outcome{}, fmt.Errorf("probing %s: %w", o.URL, err)
-	}
-
-	path, err := destPath(o.Dest, info.Filename)
-	if err != nil {
-		return Outcome{}, err
-	}
-	out := Outcome{Path: path, Size: info.Size, Ranges: info.Ranges}
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return out, err
-	}
-	defer f.Close()
-	// Size the file up front so every chunk can be written at its true offset.
-	// The file is sparse until the bytes arrive, so this costs nothing.
-	if err := f.Truncate(info.Size); err != nil {
-		return out, fmt.Errorf("sizing %s: %w", path, err)
-	}
-
-	if !info.Ranges {
-		// The server ignored the Range header, so there is nothing to split.
-		// One stream on one link, reported honestly rather than pretending.
-		return fallback(ctx, clients[0], info.URL, f, out)
-	}
-
-	p := plan.New(info.Size, o.ChunkSize)
-	current := plan.State{
-		URL:          info.URL,
-		Filename:     info.Filename,
-		Size:         info.Size,
-		ChunkSize:    p.ChunkSize,
-		ETag:         info.ETag,
-		LastModified: info.LastModified,
-	}
-
-	sidecar := path + sidecarExt
-	bits := plan.NewBitmap(p.Chunks)
-	if saved, err := plan.Load(sidecar); err == nil && saved.Resumable(current) {
-		bits = plan.BitmapFromBytes(p.Chunks, saved.Bits)
-		out.Resumed = true
-	} else {
-		// Either there is no saved progress or it belongs to a different file.
-		// Refusing to reuse it is the whole point: resuming across a changed
-		// remote file would silently stitch two files together.
-		os.Remove(sidecar)
-	}
-
-	cfg := sched.Config{
-		Plan:           p,
-		Bits:           bits,
-		Out:            f,
-		Links:          schedLinks(clients, info.URL, o.WorkersPerLink),
-		TailStealAfter: o.TailStealAfter,
-		ChunkTimeout:   o.ChunkTimeout,
-		OnProgress: func(pr sched.Progress) {
-			// Persisted as chunks land, so an interrupted transfer resumes from
-			// where it actually got to.
-			current.Bits = bits.Bytes()
-			_ = plan.Save(sidecar, current)
-			if o.OnProgress != nil {
-				o.OnProgress(pr.DoneChunks, pr.TotalChunks, pr.Bytes, pr.Link)
-			}
-		},
-	}
-
-	res, runErr := sched.Run(ctx, cfg)
-	out.Result = res
-
-	if errors.Is(runErr, ErrRangeIgnored) {
-		// The server promised slices and sent whole bodies. Nothing fetched so
-		// far can be trusted, so discard it and take the one path that yields a
-		// correct file.
-		os.Remove(sidecar)
-		out.Ranges = false
-		out.Resumed = false
-		return fallback(ctx, clients[0], info.URL, f, out)
-	}
-	if runErr != nil {
-		// Keep the sidecar: it is what makes the next attempt cheap.
-		current.Bits = bits.Bytes()
-		_ = plan.Save(sidecar, current)
-		return out, runErr
-	}
-	if err := f.Sync(); err != nil {
-		return out, err
-	}
-	os.Remove(sidecar)
-	return out, nil
+	return o, clients, err
 }
 
 func buildClients(o Options) ([]linkClient, error) {
@@ -248,57 +413,6 @@ func destPath(dest, filename string) (string, error) {
 	return dest, nil
 }
 
-// fallback downloads the whole file over one link and reports the length that
-// actually arrived. A server that misreports a range usually misreports its
-// length too, so the file is sized to what was received, never to what was
-// advertised.
-func fallback(ctx context.Context, c linkClient, url string, f *os.File, out Outcome) (Outcome, error) {
-	n, err := singleStream(ctx, c.client, url, f)
-	if err != nil {
-		return out, err
-	}
-	if err := f.Truncate(n); err != nil {
-		return out, fmt.Errorf("resizing %s to the %d bytes received: %w", out.Path, n, err)
-	}
-	out.Size = n
-	out.Ranges = false
-	out.Result = sched.Result{Bytes: n, ByLink: map[string]int{c.link.Iface: 1}}
-	return out, f.Sync()
-}
-
-func singleStream(ctx context.Context, client *http.Client, url string, w io.WriterAt) (int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return 0, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("single-stream GET returned HTTP %d", resp.StatusCode)
-	}
-
-	var written int64
-	buf := make([]byte, 256<<10)
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, err := w.WriteAt(buf[:n], written); err != nil {
-				return written, err
-			}
-			written += int64(n)
-		}
-		if readErr == io.EOF {
-			return written, nil
-		}
-		if readErr != nil {
-			return written, readErr
-		}
-	}
-}
-
 // httpFetcher fetches one byte range over an already-pinned client.
 type httpFetcher struct {
 	client *http.Client
@@ -321,8 +435,8 @@ func (f *httpFetcher) Fetch(ctx context.Context, start, end int64) ([]byte, erro
 		resp.Body.Close()
 	}()
 
-	// Anything but 206 means we did not get the slice we asked for. Accepting
-	// a 200 here would write the whole file into one chunk's slot.
+	// Anything but 206 means we did not get the slice we asked for. Accepting a
+	// 200 here would write the whole file into one chunk's slot.
 	if resp.StatusCode != http.StatusPartialContent {
 		return nil, fmt.Errorf("chunk %d-%d: expected 206, got HTTP %d", start, end, resp.StatusCode)
 	}
@@ -336,11 +450,10 @@ func (f *httpFetcher) Fetch(ctx context.Context, start, end int64) ([]byte, erro
 	}
 	switch {
 	case int64(len(body)) > want:
-		// More than we asked for means the range was not honoured, whatever
-		// the status line claimed. Retrying cannot help; the caller must stop
-		// splitting this URL.
-		// Wraps sched.ErrFatal too, so the scheduler stops instead of
-		// re-downloading the whole file on every retry.
+		// More than we asked for means the range was not honoured, whatever the
+		// status line claimed. Retrying cannot help, and each attempt may cost a
+		// whole file's worth of bytes, so this also wraps sched.ErrFatal to stop
+		// the scheduler rather than let it retry.
 		return nil, fmt.Errorf("chunk %d-%d: got at least %d bytes for a %d byte range: %w: %w",
 			start, end, len(body), want, ErrRangeIgnored, sched.ErrFatal)
 	case int64(len(body)) < want:

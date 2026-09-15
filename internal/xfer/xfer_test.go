@@ -17,6 +17,7 @@ import (
 
 	"braid/internal/linkset"
 	"braid/internal/plan"
+	"braid/internal/stream"
 )
 
 func payload(n int) []byte {
@@ -441,5 +442,89 @@ func TestFetcherFlagsAnOverlongBody(t *testing.T) {
 	}
 	if !errors.Is(err, ErrRangeIgnored) {
 		t.Errorf("error should wrap ErrRangeIgnored so the caller can fall back, got %v", err)
+	}
+}
+
+func TestStartExposesATransferWhileItIsStillFilling(t *testing.T) {
+	// What /stream needs: begin fetching, then read the file in order from the
+	// front while later chunks are still arriving over the links.
+	data := payload(2000)
+	srv := httptest.NewServer((&rangeServer{data: data, etag: `"v1"`}).handler())
+	defer srv.Close()
+
+	tr, err := Start(context.Background(), baseOpts(srv.URL+"/live.bin", t.TempDir(), loopbackLinks("a", "b")))
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tr.Close()
+
+	if tr.Info.Size != int64(len(data)) {
+		t.Errorf("Size = %d, want %d", tr.Info.Size, len(data))
+	}
+	if !tr.Info.Ranges {
+		t.Error("Ranges = false against a range-capable server")
+	}
+	if tr.Plan.Chunks != 20 {
+		t.Errorf("Chunks = %d, want 20", tr.Plan.Chunks)
+	}
+
+	// Read the whole thing through the in-order reader as it fills.
+	var out bytes.Buffer
+	n, err := stream.Copy(context.Background(), &out, tr.Plan, tr.Bits, tr.ReaderAt(), 0, tr.Info.Size-1)
+	if err != nil {
+		t.Fatalf("streaming while filling: %v", err)
+	}
+	if n != int64(len(data)) {
+		t.Errorf("streamed %d bytes, want %d", n, len(data))
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Fatal("streamed bytes do not match the source")
+	}
+
+	res, err := tr.Wait()
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if res.Bytes != int64(len(data)) {
+		t.Errorf("fetched %d bytes, want %d", res.Bytes, len(data))
+	}
+}
+
+func TestStartReportsAProbeFailureImmediately(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	if _, err := Start(context.Background(), baseOpts(srv.URL+"/missing", t.TempDir(), loopbackLinks("a"))); err == nil {
+		t.Fatal("Start must fail when the URL cannot be probed")
+	}
+}
+
+func TestStartOnAnUnsplittableURLStillServesTheFile(t *testing.T) {
+	// A server that ignores ranges has one chunk covering everything, so a
+	// reader still gets correct bytes — just from a single link.
+	data := payload(3000)
+	srv := httptest.NewServer((&rangeServer{data: data, ignoreRange: true}).handler())
+	defer srv.Close()
+
+	tr, err := Start(context.Background(), baseOpts(srv.URL+"/plain.bin", t.TempDir(), loopbackLinks("a", "b")))
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tr.Close()
+	if tr.Info.Ranges {
+		t.Error("Ranges = true against a server that ignores Range")
+	}
+
+	var out bytes.Buffer
+	if _, err := stream.Copy(context.Background(), &out, tr.Plan, tr.Bits, tr.ReaderAt(), 0, tr.Info.Size-1); err != nil {
+		t.Fatalf("streaming: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Error("streamed bytes do not match the source")
+	}
+	if _, err := tr.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
 	}
 }
