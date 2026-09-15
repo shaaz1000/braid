@@ -466,10 +466,13 @@ Further findings, each with a design consequence:
 - **A link's faster family changes between runs.** Wi-Fi favoured IPv4 in the
   first run (100.0 vs 95.6) and IPv6 in this one (94.1 vs 84.6). Per-link
   per-family EWMA is load-bearing, not a refinement.
-- **USB tethering offers no IPv6 whatsoever**, while the *same phone's* Wi-Fi
-  hotspot handed out a global `2001:db8:2:…`. Family availability is a
-  property of the tethering method, not the carrier — so `dial` must error on a
-  missing family rather than assume dual-stack.
+- **A link's available address families change over time.** The USB tether had
+  no IPv6 at all during the spike, and a global `2001:db8:2:…` appeared on
+  the same interface minutes later, once SLAAC completed. (An earlier revision of
+  this document claimed USB tethering never offers IPv6. That was wrong, and the
+  corrected fact is the more demanding one.) So `dial` must error on a missing
+  family rather than assume dual-stack, and `linkset` must re-read addresses
+  continuously rather than resolving families once at startup.
 - **USB 2.0 is not the bottleneck at these speeds.** USB tether measured
   107.3 Mbps against 112.8 for the same phone over Wi-Fi hotspot — close enough
   that the earlier worry about USB throttling 5G is unfounded below ~250 Mbps.
