@@ -565,3 +565,64 @@ func TestChunkBytesAreOnDiskBeforeTheBitIsSet(t *testing.T) {
 		t.Errorf("%d chunk(s) had their bit set before the bytes were written; a streaming reader would serve zeros", n)
 	}
 }
+
+func TestAFewLargeChunksDoNotStrandTheTransferOnASlowLink(t *testing.T) {
+	// The real-world failure, reproduced. Large blocks mean few chunks, and
+	// with few chunks one bad assignment is catastrophic: a 33.5 MB download
+	// over Wi-Fi at 102 Mbps plus cellular at 7 took 13 seconds instead of 2,
+	// because cellular grabbed one 8 MB block and held it while Wi-Fi idled.
+	//
+	// A plentiful queue hides this — the shared queue alone is enough when
+	// there are forty chunks. It is exactly the few-chunk case that needs
+	// rescuing, which is what tail stealing is for.
+	data := source(500)
+	p := plan.New(int64(len(data)), 100) // only 5 chunks
+	out := newSink(len(data))
+
+	fast := &fakeLink{data: data}
+	crawling := &fakeLink{data: data, delay: 3 * time.Second}
+
+	cfg := fastOpts(p, plan.NewBitmap(p.Chunks), out,
+		Link{Name: "fast", Fetcher: fast, Workers: 1},
+		Link{Name: "crawling", Fetcher: crawling, Workers: 1},
+	)
+	cfg.TailStealAfter = 150 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	res, err := Run(ctx, cfg)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !bytes.Equal(out.bytes(), data) {
+		t.Fatal("output does not match the source")
+	}
+	// Without rescue this waits the full 3 seconds for the slow link's block.
+	if elapsed > 1500*time.Millisecond {
+		t.Errorf("took %v; the transfer is still stranded on the slow link", elapsed)
+	}
+	if res.TailSteals == 0 {
+		t.Error("nothing was stolen, so the slow link was simply waited on")
+	}
+}
+
+func TestASingleSlowLinkIsStillUsedWhenItIsAllThereIs(t *testing.T) {
+	// Demotion must never strand a transfer. With nothing faster to compare
+	// against, a slow link is simply the link.
+	data := source(600)
+	p := plan.New(int64(len(data)), 100)
+	out := newSink(len(data))
+
+	slow := &fakeLink{data: data, delay: 5 * time.Millisecond}
+	if _, err := Run(context.Background(), fastOpts(p, plan.NewBitmap(p.Chunks), out,
+		Link{Name: "slow", Fetcher: slow, Workers: 2},
+	)); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !bytes.Equal(out.bytes(), data) {
+		t.Error("output does not match the source")
+	}
+}

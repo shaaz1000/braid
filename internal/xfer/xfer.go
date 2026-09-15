@@ -45,40 +45,47 @@ const (
 	// for a fast link to steal.
 	minChunk int64 = 1 << 20
 	maxChunk int64 = 8 << 20
+	// maxBlocks caps the block list on very large files; past this the chunk
+	// grows rather than the count.
+	maxBlocks int64 = 4096
 )
 
-// chunkPlan picks a chunk size and a per-link worker count that leave room for
-// work stealing.
+// chunkPlan picks a chunk size and a per-link worker count.
 //
-// Two forces pull against each other. Work stealing needs chunks to massively
-// outnumber workers, or the split freezes at the start and the whole transfer
-// waits for the slowest link — a 33.5 MB file at the old fixed 4 MB gave 9
-// chunks across 8 workers and measured 40.8 Mbps against 93.1 for the fast
-// link alone. But every chunk costs a round trip, so shrinking them without
-// limit bleeds throughput instead.
+// The instinct is to shrink chunks so work stealing has more to steal. That is
+// wrong, and measurably so: a connection issues one request at a time, so every
+// chunk costs a round trip, and 1 MB chunks dragged a cellular link from
+// 21.8 Mbps down to 7.8. The prior art (anmolkapil/plexo) keeps blocks fixed at
+// 8 MB regardless of file size for exactly this reason.
 //
-// So: size the chunk from the file, clamp it, then scale workers to whatever
-// the resulting chunk count can actually keep busy.
+// So the chunk stays large and the WORKER COUNT adapts down instead. Fewer,
+// busier connections beat many starved ones.
 func chunkPlan(size int64, links int, requested int64) (chunk int64, workersPerLink int) {
 	if links < 1 {
 		links = 1
 	}
+
 	if requested > 0 {
+		// An explicit size is honoured exactly. Someone passing -chunk means
+		// it, and clamping it silently would make the flag a lie.
 		chunk = requested
 	} else {
-		chunk = size / 32
+		chunk = maxChunk
+		// Only grow past the fixed size for files so large the block list
+		// would become unwieldy.
+		if grown := size / maxBlocks; grown > chunk {
+			chunk = grown
+		}
 		if chunk < minChunk {
 			chunk = minChunk
-		}
-		if chunk > maxChunk {
-			chunk = maxChunk
 		}
 	}
 
 	chunks := (size + chunk - 1) / chunk
-	// Four chunks per worker keeps the queue deep enough that a fast link can
-	// take well beyond its share without starving the pool.
-	workersPerLink = int(chunks / int64(links*4))
+	// Two chunks per worker is enough headroom for a fast link to take more
+	// than its share, without splitting the file so finely that round trips
+	// dominate.
+	workersPerLink = int(chunks / int64(links*2))
 	if workersPerLink < 1 {
 		workersPerLink = 1
 	}

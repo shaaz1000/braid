@@ -34,8 +34,9 @@ get flags:
   -chunk <bytes>  chunk size (default 4194304)
   -workers <n>    concurrent fetches per link (default 4)
   -only <iface>   use just one uplink, e.g. -only en0 to avoid mobile data
-  -tail-steal     re-request a stalled chunk on an idle link near the end;
-                  costs duplicate bytes on a metered link, so it is off by default
+  -no-tail-steal  do not rescue a chunk stuck on a slow link near the end
+                  (rescuing is on by default; it costs a few duplicate bytes
+                  on the FAST link and can save many seconds)
 
 serve flags:
   -port <n>       port to listen on (default 8080)
@@ -137,7 +138,7 @@ func cmdGet(args []string) error {
 	dest := fs.String("o", "", "output directory or file path")
 	chunk := fs.Int64("chunk", 0, "chunk size in bytes")
 	workers := fs.Int("workers", 0, "concurrent fetches per link")
-	tailSteal := fs.Bool("tail-steal", false, "re-request a stalled chunk near the end")
+	noTailSteal := fs.Bool("no-tail-steal", false, "never re-request a stalled chunk near the end")
 	only := fs.String("only", "", "use just this interface, e.g. en0 (useful to avoid spending mobile data)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -184,8 +185,12 @@ func cmdGet(args []string) error {
 		Links:          links,
 		ChunkTimeout:   20 * time.Second,
 	}
-	if *tailSteal {
-		opts.TailStealAfter = 5 * time.Second
+	// On by default. A slow link holding the last large block is the single
+	// worst case for bonding - measured at 13s against 2s for the fast link
+	// alone - and the duplicate bytes land on the FAST link, not the metered
+	// one, so the rescue is close to free.
+	if !*noTailSteal {
+		opts.TailStealAfter = 3 * time.Second
 	}
 
 	started := time.Now()
@@ -322,6 +327,9 @@ func cmdServe(args []string) error {
 		ChunkSize:      *chunk,
 		WorkersPerLink: *workers,
 		ChunkTimeout:   20 * time.Second,
+		// Same reasoning as `get`: a slow link holding the last block is the
+		// worst case, and the rescue costs duplicate bytes on the fast link.
+		TailStealAfter: 3 * time.Second,
 	})
 	if err != nil {
 		return err
