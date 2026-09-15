@@ -29,7 +29,7 @@ These are observations, not assumptions. Each one shaped a decision below.
 | Observation | How it was measured | Design consequence |
 |---|---|---|
 | Wi-Fi `en0` = 192.168.1.42, 802.11ac, 5 GHz, 80 MHz, 650 Mbps link rate | `networksetup`, `system_profiler SPAirPortDataType` | Local radio is not the bottleneck |
-| Real Wi-Fi throughput **≈108–190 Mbps** (20 MB in 1.47 s) | `curl` against `speed.cloudflare.com` | Cellular has to be genuinely fast to help. Expect +30–80%, not +100% |
+| Real Wi-Fi throughput **≈100 Mbps sustained** (95.4 MB over 8 s, pinned, 4 connections) | `spike measure` — see the Phase 0 log. An earlier 1.47 s single-shot read 108–190 Mbps; that was burst, not sustained | Cellular has to be genuinely fast to help. Expect +30–80%, not +100% |
 | `en0` carries **both** IPv4 and IPv6, and **IPv6 is preferred** — egress went out over `2001:db8:ff::1` | `ifconfig en0`, `curl -w %{remote_ip}` | Socket pinning **must be per address family**. A v4-only implementation would silently fall through to Wi-Fi and still appear to work |
 | The ISP is a large mobile-and-fixed carrier with a regional egress | Cloudflare `cf-meta-*` headers | Indian cellular is frequently IPv6-first / 464XLAT, reinforcing the above |
 | `iPhone USB` is a **configured service on `en5`**, but `en5` does not exist while the phone is unplugged | `networksetup -listnetworkserviceorder`, `ifconfig en5` | Links must be hot-plugged: discovered, weighted and dropped at runtime |
