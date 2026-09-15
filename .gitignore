@@ -3,3 +3,7 @@
 /spike/spike
 *.braid
 .DS_Store
+apps/**/build/
+apps/**/build-sim/
+apps/**/*.xcodeproj/
+apps/**/DerivedData/

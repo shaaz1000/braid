@@ -1,0 +1,30 @@
+name: BraidSpike
+options:
+  bundleIdPrefix: com.shaazkhan
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+targets:
+  BraidSpike:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.shaazkhan.braidspike
+        PRODUCT_NAME: BraidSpike
+        DEVELOPMENT_TEAM: GRFA8BR7C4
+        CODE_SIGN_STYLE: Automatic
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        SWIFT_VERSION: "5.0"
+        # The spike deliberately uses locks and callbacks around Network
+        # framework; strict concurrency checking adds noise without adding
+        # safety for throwaway measurement code.
+        SWIFT_STRICT_CONCURRENCY: minimal
+        TARGETED_DEVICE_FAMILY: "1,2"
