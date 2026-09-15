@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -45,7 +46,7 @@ type fakeLink struct {
 	callCount int
 }
 
-func (f *fakeLink) Fetch(ctx context.Context, start, end int64) ([]byte, error) {
+func (f *fakeLink) Fetch(ctx context.Context, start, end int64, into io.WriterAt) (int64, error) {
 	f.mu.Lock()
 	f.asked = append(f.asked, [2]int64{start, end})
 	f.callCount++
@@ -53,25 +54,24 @@ func (f *fakeLink) Fetch(ctx context.Context, start, end int64) ([]byte, error) 
 
 	if f.blockAll || (f.blockFrom != nil && start == *f.blockFrom) {
 		<-ctx.Done()
-		return nil, ctx.Err()
+		return 0, ctx.Err()
 	}
 	if f.failAlways {
-		return nil, errors.New("link is down")
+		return 0, errors.New("link is down")
 	}
 	if f.failFirst.Load() > 0 {
 		f.failFirst.Add(-1)
-		return nil, errors.New("transient failure")
+		return 0, errors.New("transient failure")
 	}
 	if f.delay > 0 {
 		select {
 		case <-time.After(f.delay):
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
-	out := make([]byte, end-start+1)
-	copy(out, f.data[start:end+1])
-	return out, nil
+	n, err := into.WriteAt(f.data[start:end+1], start)
+	return int64(n), err
 }
 
 func (f *fakeLink) calls() int {
@@ -483,12 +483,14 @@ func TestShortFetchIsRejected(t *testing.T) {
 
 type truncatingFetcher struct{ data []byte }
 
-func (f truncatingFetcher) Fetch(ctx context.Context, start, end int64) ([]byte, error) {
+func (f truncatingFetcher) Fetch(ctx context.Context, start, end int64, into io.WriterAt) (int64, error) {
 	full := end - start + 1
 	if full < 2 {
-		return nil, fmt.Errorf("range too small to truncate")
+		return 0, fmt.Errorf("range too small to truncate")
 	}
-	return f.data[start : start+full-1], nil // one byte short, every time
+	// One byte short, every time.
+	n, err := into.WriteAt(f.data[start:start+full-1], start)
+	return int64(n), err
 }
 
 func TestFatalErrorsAreNotRetried(t *testing.T) {
@@ -516,9 +518,9 @@ func TestFatalErrorsAreNotRetried(t *testing.T) {
 
 type fatalFetcher struct{ calls atomic.Int32 }
 
-func (f *fatalFetcher) Fetch(ctx context.Context, start, end int64) ([]byte, error) {
+func (f *fatalFetcher) Fetch(ctx context.Context, start, end int64, into io.WriterAt) (int64, error) {
 	f.calls.Add(1)
-	return nil, fmt.Errorf("server ignored the range: %w", ErrFatal)
+	return 0, fmt.Errorf("server ignored the range: %w", ErrFatal)
 }
 
 // orderCheckingSink asserts the load-bearing invariant for streaming: a

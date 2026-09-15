@@ -24,10 +24,17 @@ import (
 // attempt, which on a metered link costs real money.
 var ErrFatal = errors.New("unrecoverable, do not retry")
 
-// Fetcher retrieves one inclusive byte range. Implementations are expected to
-// be pinned to a single interface.
+// Fetcher retrieves one inclusive byte range, writing it straight into `into`
+// at the range's own offsets as the bytes arrive.
+//
+// It writes rather than returning a buffer so a chunk never has to be held in
+// memory: with eight workers and multi-megabyte blocks that was tens of
+// megabytes of buffer, and it was also why large blocks felt unaffordable.
+// The prior art (anmolkapil/plexo) streams each block to disk the same way.
+//
+// Implementations are expected to be pinned to a single interface.
 type Fetcher interface {
-	Fetch(ctx context.Context, start, end int64) ([]byte, error)
+	Fetch(ctx context.Context, start, end int64, into io.WriterAt) (int64, error)
 }
 
 // Link is one uplink and how many concurrent fetches to run on it.
@@ -208,6 +215,13 @@ func runWorker(ctx context.Context, cfg Config, q *queue, l Link, mu *sync.Mutex
 			return
 		}
 
+		if cfg.Bits.Get(idx) {
+			// A tail-steal rival already finished this one; do not spend the
+			// bytes again.
+			q.release(idx)
+			continue
+		}
+
 		start, end := cfg.Plan.Range(idx)
 		want := end - start + 1
 
@@ -216,15 +230,18 @@ func runWorker(ctx context.Context, cfg Config, q *queue, l Link, mu *sync.Mutex
 		if cfg.ChunkTimeout > 0 {
 			fetchCtx, cancelFetch = context.WithTimeout(ctx, cfg.ChunkTimeout)
 		}
-		body, err := l.Fetcher.Fetch(fetchCtx, start, end)
+		// Under tail stealing two workers may hold the same range. Both write
+		// identical bytes to identical offsets, so an interleaved write is
+		// harmless; the bitmap decides which one gets the credit.
+		got, err := l.Fetcher.Fetch(fetchCtx, start, end, cfg.Out)
 		if cancelFetch != nil {
 			cancelFetch()
 		}
 
-		// A body shorter than the range asked for would leave a hole that the
+		// Fewer bytes than the range asked for would leave a hole that the
 		// bitmap claims is filled, so it counts as a failure.
-		if err == nil && int64(len(body)) != want {
-			err = fmt.Errorf("chunk %d: got %d bytes, want %d", idx, len(body), want)
+		if err == nil && got != want {
+			err = fmt.Errorf("chunk %d: got %d bytes, want %d", idx, got, want)
 		}
 
 		if err != nil {
@@ -252,23 +269,11 @@ func runWorker(ctx context.Context, cfg Config, q *queue, l Link, mu *sync.Mutex
 			continue
 		}
 
-		// Under tail stealing two workers hold the same range, so skip the work
-		// if the other one already finished it.
-		if cfg.Bits.Get(idx) {
-			q.release(idx)
-			continue
-		}
-		// Write BEFORE publishing. The bitmap is a promise that these bytes are
-		// on disk: a reader serving the file in order wakes on Set and reads
-		// whatever is at that offset, so setting the bit first would hand it
-		// zeros. Publishing early was invisible to a plain download, where
-		// nothing reads concurrently, and corrupts every streamed response.
-		if _, err := cfg.Out.WriteAt(body, start); err != nil {
-			// The bytes are good but the disk refused them. This is not
-			// retryable on another link.
-			q.abort(fmt.Errorf("writing chunk %d at offset %d: %w", idx, start, err))
-			return
-		}
+		// The bytes are already on disk by now, written as they arrived. The
+		// bitmap is published only afterwards, because it is a promise that
+		// those bytes are readable: a reader serving the file in order wakes on
+		// Set and reads whatever is at that offset, so publishing first would
+		// hand it zeros.
 		if !cfg.Bits.Set(idx) {
 			// A tail-steal rival published first. Its bytes are identical to
 			// ours, so the duplicate write was harmless — but the chunk is not

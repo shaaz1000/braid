@@ -46,6 +46,9 @@ type Options struct {
 	// Links is re-read per request, because interfaces come and go.
 	Links func() []linkset.Link
 
+	// CacheLimit bounds the streamed-file cache. Zero means DefaultCacheLimit.
+	CacheLimit int64
+
 	Dialer         xfer.Dialer
 	ChunkSize      int64
 	WorkersPerLink int
@@ -99,6 +102,12 @@ func New(o Options) (*Server, error) {
 	if o.Links == nil {
 		return nil, errors.New("no link source configured")
 	}
+
+	if o.CacheLimit <= 0 {
+		o.CacheLimit = DefaultCacheLimit
+	}
+	// Trim anything left over from previous runs before serving.
+	_, _ = evictCache(o.CacheDir, o.CacheLimit)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
@@ -428,6 +437,9 @@ func (s *Server) transferFor(ctx context.Context, raw string) (*entry, error) {
 			err = tr.Sync()
 		}
 		e.finish(err)
+		// Keeping files is what makes a repeat request free; keeping them
+		// without a bound quietly fills the disk.
+		_, _ = evictCache(s.opts.CacheDir, s.opts.CacheLimit)
 	}()
 	return e, nil
 }

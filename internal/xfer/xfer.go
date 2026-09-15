@@ -485,16 +485,16 @@ type httpFetcher struct {
 	url    string
 }
 
-func (f *httpFetcher) Fetch(ctx context.Context, start, end int64) ([]byte, error) {
+func (f *httpFetcher) Fetch(ctx context.Context, start, end int64, into io.WriterAt) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.url, nil)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	defer func() {
 		io.Copy(io.Discard, resp.Body)
@@ -504,26 +504,40 @@ func (f *httpFetcher) Fetch(ctx context.Context, start, end int64) ([]byte, erro
 	// Anything but 206 means we did not get the slice we asked for. Accepting a
 	// 200 here would write the whole file into one chunk's slot.
 	if resp.StatusCode != http.StatusPartialContent {
-		return nil, fmt.Errorf("chunk %d-%d: expected 206, got HTTP %d", start, end, resp.StatusCode)
+		return 0, fmt.Errorf("chunk %d-%d: expected 206, got HTTP %d", start, end, resp.StatusCode)
 	}
 
 	want := end - start + 1
-	// Bounded by one extra byte so an over-long body is detected rather than
-	// read into memory without limit.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, want+1))
-	if err != nil {
-		return nil, err
+	buf := make([]byte, 128<<10)
+	var written int64
+
+	for written <= want {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if written+int64(n) > want {
+				// More than the range promised. Retrying cannot help, so this
+				// also wraps sched.ErrFatal to stop the scheduler rather than
+				// let it re-download the whole file on every attempt.
+				return written, fmt.Errorf("chunk %d-%d: server sent more than the %d byte range: %w: %w",
+					start, end, want, ErrRangeIgnored, sched.ErrFatal)
+			}
+			// Written at its true offset as it arrives, so nothing is held in
+			// memory and a reader can follow the file forward.
+			if _, err := into.WriteAt(buf[:n], start+written); err != nil {
+				return written, fmt.Errorf("writing chunk at offset %d: %w", start+written, err)
+			}
+			written += int64(n)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return written, readErr
+		}
 	}
-	switch {
-	case int64(len(body)) > want:
-		// More than we asked for means the range was not honoured, whatever the
-		// status line claimed. Retrying cannot help, and each attempt may cost a
-		// whole file's worth of bytes, so this also wraps sched.ErrFatal to stop
-		// the scheduler rather than let it retry.
-		return nil, fmt.Errorf("chunk %d-%d: got at least %d bytes for a %d byte range: %w: %w",
-			start, end, len(body), want, ErrRangeIgnored, sched.ErrFatal)
-	case int64(len(body)) < want:
-		return nil, fmt.Errorf("chunk %d-%d: got %d bytes, want %d", start, end, len(body), want)
+
+	if written != want {
+		return written, fmt.Errorf("chunk %d-%d: got %d bytes, want %d", start, end, written, want)
 	}
-	return body, nil
+	return written, nil
 }

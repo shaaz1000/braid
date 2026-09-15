@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -350,7 +351,7 @@ func TestFetcherSendsTheRangeHeaderAndRejectsAFullBody(t *testing.T) {
 	defer srv.Close()
 
 	f := &httpFetcher{client: &http.Client{}, url: srv.URL}
-	_, err := f.Fetch(context.Background(), 100, 199)
+	_, err := f.Fetch(context.Background(), 100, 199, newMemWriter(1000))
 	if err == nil {
 		t.Fatal("a 200 response to a ranged chunk request must be an error")
 	}
@@ -365,12 +366,16 @@ func TestFetcherReturnsTheRequestedSlice(t *testing.T) {
 	defer srv.Close()
 
 	f := &httpFetcher{client: &http.Client{}, url: srv.URL}
-	got, err := f.Fetch(context.Background(), 100, 199)
+	sink := newMemWriter(len(data))
+	n, err := f.Fetch(context.Background(), 100, 199, sink)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	if !bytes.Equal(got, data[100:200]) {
-		t.Error("Fetch returned the wrong bytes")
+	if n != 100 {
+		t.Errorf("wrote %d bytes, want 100", n)
+	}
+	if !bytes.Equal(sink.bytes()[100:200], data[100:200]) {
+		t.Error("Fetch wrote the wrong bytes")
 	}
 }
 
@@ -436,7 +441,7 @@ func TestFetcherFlagsAnOverlongBody(t *testing.T) {
 	defer srv.Close()
 
 	f := &httpFetcher{client: &http.Client{}, url: srv.URL}
-	_, err := f.Fetch(context.Background(), 0, 99)
+	_, err := f.Fetch(context.Background(), 0, 99, newMemWriter(10000))
 	if err == nil {
 		t.Fatal("an over-long body must be an error")
 	}
@@ -592,4 +597,33 @@ func TestChunkPlanHonoursAnExplicitChunkSize(t *testing.T) {
 	if chunk != 1<<20 {
 		t.Errorf("chunk = %d, want the requested 1 MiB", chunk)
 	}
+}
+
+// memWriter is an in-memory io.WriterAt for exercising the fetcher without a
+// file on disk.
+type memWriter struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func newMemWriter(n int) *memWriter { return &memWriter{buf: make([]byte, n)} }
+
+func (m *memWriter) WriteAt(p []byte, off int64) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if off+int64(len(p)) > int64(len(m.buf)) {
+		grown := make([]byte, off+int64(len(p)))
+		copy(grown, m.buf)
+		m.buf = grown
+	}
+	copy(m.buf[off:], p)
+	return len(p), nil
+}
+
+func (m *memWriter) bytes() []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]byte, len(m.buf))
+	copy(out, m.buf)
+	return out
 }
