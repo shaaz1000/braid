@@ -241,6 +241,33 @@ query parameter, because the clients that matter most — VLC, Infuse, an Apple 
 — cannot set request headers. The `/stream` URL is therefore self-contained and
 pasteable, which is the whole point of that endpoint.
 
+### UI requirements
+
+The web UI is a **first-class requirement, not a debug view**. It must be
+modern, clean, intuitively obvious without explanation, and animated with
+purpose. Specifically:
+
+- **Legible at a glance.** The one question the UI answers is "is bonding
+  working right now, and how much is each link contributing?" That must be
+  readable in under a second, from across a room, without interpreting a number.
+- **Animation that carries information**, never decoration: live per-link
+  throughput, chunks landing on the progress map coloured by the link that
+  fetched them, a link going dead or hitting its budget. Motion should show the
+  two streams merging, because that *is* the product. Every animation must
+  respect `prefers-reduced-motion`.
+- **Intuitive on a phone.** The phone is a primary client, not an afterthought,
+  so the layout is responsive and touch-first, and `/stream` URLs are one tap to
+  copy or share.
+- **Light and dark**, following the system, both deliberately designed.
+- **No framework build step.** Server-rendered HTML plus a single vanilla
+  JS/CSS bundle, driven by the SSE stream that already exists. This preserves
+  the single-binary promise (assets embedded with `go:embed`) and keeps the UI
+  from becoming a second project with its own toolchain.
+
+Design directions are to be presented and approved **before** the UI is built,
+using the `frontend-design` skill. Aesthetic direction is not to be improvised
+during implementation.
+
 ## Data flow
 
 **`braid get <url>`** — probe → plan → open sparse file → start `sched` over all
@@ -338,3 +365,28 @@ rather than an Electron app, in serving other devices over the LAN, in pinning
 with `*_BOUND_IF` per address family rather than a source address alone, in
 writing one sparse file rather than merging part files, and in adding tail
 stealing, streaming bias and metered-link budgets.
+
+## Phase 0 log
+
+**2026-09-15, Wi-Fi only (phone not yet attached).** Spike harness built and
+validated; `spike links` resolves `en0` as "Wi-Fi", index 11, with both an IPv4
+and an IPv6 global address.
+
+| Test | Result |
+|---|---|
+| Wi-Fi sustained, IPv4, pinned | **100.0 Mbps** (95.4 MB in 8 s) |
+| Wi-Fi sustained, IPv6, pinned | **95.6 Mbps** (91.2 MB in 8 s) |
+| Kernel counter cross-check | 101.0 MB seen on `en0` vs 95.4 MB at the app — overhead-sized gap, counters agree |
+| Sandbox limit | Worked around: repeated 20 MB requests sustain ~95 MB total where one 300 MB request failed |
+| `speed.cloudflare.com/__down` | Returns **200, no ranges** — usable as a throughput payload only |
+| `dl.google.com/go/go1.27.1.darwin-arm64.tar.gz` | **206, 64.9 MB** — the real range-capable test file for Phase 1 |
+| `cdn.jsdelivr.net` | 206, ranges honoured |
+
+Baseline revised down: the earlier 108–190 Mbps figure was a single-shot burst.
+Sustained Wi-Fi is ~100 Mbps, which is the number cellular has to be measured
+against.
+
+**Still open, and blocked on the iPhone being attached over USB:** whether
+`IP_BOUND_IF` genuinely pins across *two* links. With a single uplink the check
+passes trivially, since there is nowhere else for traffic to go, so it proves
+the harness works and nothing about the premise.
