@@ -151,8 +151,7 @@ func cmdGet(args []string) error {
 	}
 	fmt.Printf("%s\nover %d link(s): %s\n\n", url, len(links), strings.Join(names, ", "))
 
-	var opts xfer.Options
-	opts = xfer.Options{
+	opts := xfer.Options{
 		URL:            url,
 		Dest:           *dest,
 		ChunkSize:      *chunk,
@@ -165,19 +164,24 @@ func cmdGet(args []string) error {
 	}
 
 	started := time.Now()
-	var lastDraw time.Time
+	interactive := human.IsTerminal(os.Stdout)
+	// Piped into a log, carriage returns pile up instead of redrawing, so slow
+	// the cadence right down and end each update with a newline.
+	painter := &human.Painter{Interval: human.DefaultInterval}
+	if !interactive {
+		painter.Interval = 2 * time.Second
+	}
 	opts.OnProgress = func(done, total int, bytesDone int64, _ string) {
-		// Throttle redraws: a 4 MB chunk can land every few milliseconds on a
-		// fast link, and repainting that often is just flicker.
-		if done < total && time.Since(lastDraw) < 100*time.Millisecond {
+		if !painter.Should(done, total, time.Now()) {
 			return
 		}
-		lastDraw = time.Now()
-		drawProgress(done, total, bytesDone, time.Since(started))
+		drawProgress(done, total, bytesDone, time.Since(started), interactive)
 	}
 
 	out, err := xfer.Get(ctx, opts)
-	fmt.Println()
+	if interactive {
+		fmt.Println()
+	}
 
 	if err != nil {
 		if out.Result.Bytes > 0 {
@@ -234,15 +238,21 @@ func printSplit(out xfer.Outcome, elapsed time.Duration) {
 	}
 }
 
-func drawProgress(done, total int, bytesDone int64, elapsed time.Duration) {
+func drawProgress(done, total int, bytesDone int64, elapsed time.Duration, interactive bool) {
 	pct := 0.0
 	if total > 0 {
 		pct = float64(done) / float64(total) * 100
 	}
-	fmt.Printf("\r  %s %5.1f%%  %9s  %11s  eta %-6s",
+	lead, trail := "\r", ""
+	if !interactive {
+		lead, trail = "", "\n"
+	}
+	fmt.Printf("%s  %s %5.1f%%  %9s  %11s  eta %-6s%s",
+		lead,
 		human.Bar(int(float64(done)/float64(max(total, 1))*24+0.5), 24),
 		pct, human.Bytes(bytesDone), human.Rate(bytesDone, elapsed),
-		human.ETA(int64(done), int64(total), elapsed))
+		human.ETA(int64(done), int64(total), elapsed),
+		trail)
 }
 
 func max(a, b int) int {

@@ -482,3 +482,54 @@ Further findings, each with a design consequence:
 - **Interface churn is real.** Across this session `en5`, `en6` and `en14` each
   appeared and vanished, and macOS spawned duplicate services. The hot-plug
   requirement in `linkset` is fully justified.
+
+### Phase 1 verdict: DONE
+
+`braid links` and `braid get` work. 51 tests across 7 packages, green under
+`-race` and repeated runs.
+
+**Verified against real hardware**, two live uplinks (Wi-Fi `en0` + iPhone USB
+`en5`):
+
+| | Result |
+|---|---|
+| 64.9 MB (`dl.google.com` Go tarball) | **2 s at 183.4 Mbps** |
+| Split | 52.9% `en0` / 47.1% `en5` — near-even, as work stealing should give for near-equal links |
+| Versus best single link (~107 Mbps) | **+71%** |
+| Integrity | **SHA256 matches Google's published hash exactly** (`ee215d57…87d12`, 68,100,347 bytes) |
+| Interrupt and resume | SIGINT left a 233-byte sidecar at 1/65 chunks; re-run fetched only the remaining 63.9 MB; checksum still matched; sidecar cleaned up |
+
+That checksum is the claim worth keeping: 17 chunks pulled out of order across
+two different network interfaces reassemble byte-identically.
+
+Two things found only by running it for real:
+
+**A CDN that lies about ranges.** `cdn.jsdelivr.net` answers `206` with
+`Content-Range: bytes 0-1494133/1494134` and then sends 8,928,146 bytes — the
+whole uncompressed file. Its weak ETag gives the game away: `W/"883b92…"`, and
+`0x883b92` is exactly 8,928,146. The `Content-Range` total is the *compressed*
+length while the body is the *decoded* representation, which RFC 9110 forbids.
+The chunk-length guard caught it and refused to write a corrupt 1.4 MB
+truncation. Handling added: an over-long body raises `ErrRangeIgnored` wrapping
+`sched.ErrFatal`, the scheduler stops instead of retrying, and the transfer
+falls back to a single stream sized to the bytes actually received. Retrying
+would have cost a full 8.9 MB per attempt, much of it metered.
+
+**Chunk size matters more than expected.** The same file at `-chunk 1048576`
+managed 82 Mbps against 183 Mbps at the 4 MiB default — 65 requests instead of
+17. One uncontrolled run against a variable cellular link, so suggestive rather
+than measured, but it supports the default.
+
+Deferred from this phase, and deliberately so:
+
+- **Per-family rate selection.** Each link currently uses its first available
+  family, IPv4 preferred. The spike showed the faster family flips between
+  runs, so choosing by observed rate is worth doing — but it needs live
+  measurement, which belongs with the same machinery that will drive the UI's
+  live throughput display.
+- **Adaptive worker counts.** Fixed at 4 per link. The shared queue already
+  handles unequal link speeds, so this is a refinement.
+- **The `budget` package.** Metered links are detected (via Darwin's
+  `constrained` flag) and reported, but nothing enforces a ceiling yet. Phase 1
+  testing spent roughly 200 MB of real mobile data, which is precisely the
+  argument for building it.

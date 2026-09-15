@@ -18,6 +18,12 @@ import (
 	"braid/internal/plan"
 )
 
+// ErrFatal marks a failure that retrying cannot fix, such as a server that
+// answers 206 and then sends the whole body regardless. A Fetcher wraps it to
+// say "stop now": retrying would repeat the same wasted transfer on every
+// attempt, which on a metered link costs real money.
+var ErrFatal = errors.New("unrecoverable, do not retry")
+
 // Fetcher retrieves one inclusive byte range. Implementations are expected to
 // be pinned to a single interface.
 type Fetcher interface {
@@ -212,6 +218,13 @@ func runWorker(ctx context.Context, cfg Config, q *queue, l Link, mu *sync.Mutex
 			// burning this chunk's attempt budget.
 			if ctx.Err() != nil {
 				q.release(idx)
+				return
+			}
+			// Nothing about this will improve on a second attempt, and each
+			// attempt may cost a whole file's worth of bytes.
+			if errors.Is(err, ErrFatal) {
+				q.release(idx)
+				q.abort(fmt.Errorf("chunk %d on %s: %w", idx, l.Name, err))
 				return
 			}
 			attempt := q.failed(idx, l.Name, err)

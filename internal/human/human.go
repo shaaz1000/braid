@@ -3,6 +3,7 @@ package human
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -79,4 +80,45 @@ func Bar(done, total int) string {
 	}
 	// Scale to the requested width, which here is the total itself.
 	return strings.Repeat("█", filled) + strings.Repeat("░", total-filled)
+}
+
+// DefaultInterval throttles repainting. A 4 MB chunk can land every few
+// milliseconds on a fast link, and repainting that often is only flicker.
+const DefaultInterval = 100 * time.Millisecond
+
+// Painter decides when a progress line is worth redrawing.
+type Painter struct {
+	// Interval is the minimum gap between redraws; zero means DefaultInterval.
+	Interval time.Duration
+
+	last    time.Time
+	started bool
+}
+
+// Should reports whether to redraw now. Completion always draws, so the final
+// state is never lost to throttling.
+func (p *Painter) Should(done, total int, now time.Time) bool {
+	if total > 0 && done >= total {
+		p.last, p.started = now, true
+		return true
+	}
+	interval := p.Interval
+	if interval <= 0 {
+		interval = DefaultInterval
+	}
+	if p.started && now.Sub(p.last) < interval {
+		return false
+	}
+	p.last, p.started = now, true
+	return true
+}
+
+// IsTerminal reports whether f is a character device, i.e. whether carriage
+// returns will redraw a line rather than pile up in a log file.
+func IsTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }

@@ -1,6 +1,7 @@
 package human
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -111,5 +112,56 @@ func TestBarClampsOutOfRange(t *testing.T) {
 func TestBarWithZeroTotalDoesNotDivideByZero(t *testing.T) {
 	if got := Bar(0, 0); got != "" {
 		t.Errorf("Bar(0,0) = %q, want empty", got)
+	}
+}
+
+func TestPainterAlwaysDrawsTheFinalUpdate(t *testing.T) {
+	p := &Painter{Interval: time.Hour}
+	now := time.Now()
+
+	if !p.Should(1, 10, now) {
+		t.Error("the first update should always draw")
+	}
+	if p.Should(2, 10, now) {
+		t.Error("an update inside the interval should be skipped")
+	}
+	if !p.Should(10, 10, now) {
+		t.Error("completion must always draw, however recent the last one")
+	}
+}
+
+func TestPainterDrawsAgainAfterTheInterval(t *testing.T) {
+	p := &Painter{Interval: 100 * time.Millisecond}
+	now := time.Now()
+
+	p.Should(1, 10, now)
+	if p.Should(2, 10, now.Add(50*time.Millisecond)) {
+		t.Error("50ms into a 100ms interval should be skipped")
+	}
+	if !p.Should(3, 10, now.Add(150*time.Millisecond)) {
+		t.Error("150ms into a 100ms interval should draw")
+	}
+}
+
+func TestPainterDefaultsToAUsableInterval(t *testing.T) {
+	// A zero Interval must not mean "redraw on every chunk", which on a fast
+	// link is hundreds of repaints a second.
+	p := &Painter{}
+	now := time.Now()
+	p.Should(1, 100, now)
+	if p.Should(2, 100, now.Add(time.Millisecond)) {
+		t.Error("a zero Interval should still throttle")
+	}
+}
+
+func TestIsTerminalIsFalseForARegularFile(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "notatty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if IsTerminal(f) {
+		t.Error("a regular file must not be reported as a terminal")
 	}
 }

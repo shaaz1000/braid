@@ -37,6 +37,8 @@ type fakeLink struct {
 	// blockFrom, when non-nil, makes any fetch starting at that offset wait
 	// until the context is cancelled, simulating a wedged transfer.
 	blockFrom *int64
+	// blockAll wedges every fetch, whichever chunk it is handed.
+	blockAll bool
 
 	mu        sync.Mutex
 	asked     [][2]int64
@@ -49,7 +51,7 @@ func (f *fakeLink) Fetch(ctx context.Context, start, end int64) ([]byte, error) 
 	f.callCount++
 	f.mu.Unlock()
 
-	if f.blockFrom != nil && start == *f.blockFrom {
+	if f.blockAll || (f.blockFrom != nil && start == *f.blockFrom) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
@@ -311,25 +313,28 @@ func TestRunReportsNothingToDoWhenAlreadyComplete(t *testing.T) {
 func TestTailStealingRescuesAWedgedChunk(t *testing.T) {
 	// The endgame problem: the queue is empty, every other link is idle, and
 	// one chunk is stuck on a slow link. Without tail stealing the whole
-	// transfer waits for it. Here the wedged fetch never returns at all, so
-	// completing proves another link re-requested those bytes.
+	// transfer waits for it.
+	//
+	// The wedged link blocks on whatever chunk it is handed and never returns,
+	// so exactly one chunk is always stuck no matter how the queue is drained.
+	// Blocking only one specific offset made this test racy: the healthy
+	// worker could take every chunk itself and no steal would be needed.
 	data := source(300)
 	p := plan.New(int64(len(data)), 100) // 3 chunks
 
-	var stuckAt int64 = 200 // the final chunk
-	wedged := &fakeLink{data: data, blockFrom: &stuckAt}
+	wedged := &fakeLink{data: data, blockAll: true}
 	healthy := &fakeLink{data: data, delay: 5 * time.Millisecond}
 
 	out := newSink(len(data))
 	cfg := fastOpts(p, plan.NewBitmap(p.Chunks), out,
-		// One worker each, so the wedged link genuinely has the chunk leased
+		// One worker each, so the wedged link genuinely holds a chunk leased
 		// and cannot pick up anything else.
 		Link{Name: "wedged", Fetcher: wedged, Workers: 1},
 		Link{Name: "healthy", Fetcher: healthy, Workers: 1},
 	)
 	cfg.TailStealAfter = 20 * time.Millisecond
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	res, err := Run(ctx, cfg)
@@ -342,22 +347,13 @@ func TestTailStealingRescuesAWedgedChunk(t *testing.T) {
 	if res.TailSteals == 0 {
 		t.Error("TailSteals = 0; the wedged chunk was not stolen")
 	}
-	// The wedged link is only wedged on the final chunk, so it legitimately
-	// serves the earlier ones. What matters is that the healthy link re-requested
-	// the stuck range, since the wedged fetch of it never returns at all.
-	stoleTheWedgedRange := false
-	for _, r := range healthy.ranges() {
-		if r[0] == stuckAt {
-			stoleTheWedgedRange = true
-		}
-	}
-	if !stoleTheWedgedRange {
-		t.Errorf("healthy link never requested the wedged range at offset %d; asked for %v",
-			stuckAt, healthy.ranges())
-	}
-	if res.ByLink["wedged"] >= p.Chunks {
-		t.Errorf("wedged link credited with %d chunks; it cannot have delivered the stuck one",
+	if res.ByLink["wedged"] != 0 {
+		t.Errorf("wedged link credited with %d chunks; its fetches never return",
 			res.ByLink["wedged"])
+	}
+	if res.ByLink["healthy"] != p.Chunks {
+		t.Errorf("healthy link completed %d chunks, want all %d",
+			res.ByLink["healthy"], p.Chunks)
 	}
 }
 
@@ -491,4 +487,34 @@ func (f truncatingFetcher) Fetch(ctx context.Context, start, end int64) ([]byte,
 		return nil, fmt.Errorf("range too small to truncate")
 	}
 	return f.data[start : start+full-1], nil // one byte short, every time
+}
+
+func TestFatalErrorsAreNotRetried(t *testing.T) {
+	// Some failures cannot be fixed by trying again: a server that answers 206
+	// and sends the whole body will do it every time. Retrying costs a full
+	// file download per attempt, which on a metered link is real money.
+	data := source(400)
+	p := plan.New(int64(len(data)), 100)
+	out := newSink(len(data))
+
+	f := &fatalFetcher{}
+	_, err := Run(context.Background(), fastOpts(p, plan.NewBitmap(p.Chunks), out,
+		Link{Name: "liar", Fetcher: f, Workers: 1},
+	))
+	if err == nil {
+		t.Fatal("a fatal fetch error must fail the run")
+	}
+	if !errors.Is(err, ErrFatal) {
+		t.Errorf("error should wrap ErrFatal, got %v", err)
+	}
+	if n := f.calls.Load(); n != 1 {
+		t.Errorf("fetcher called %d times; a fatal error must not be retried", n)
+	}
+}
+
+type fatalFetcher struct{ calls atomic.Int32 }
+
+func (f *fatalFetcher) Fetch(ctx context.Context, start, end int64) ([]byte, error) {
+	f.calls.Add(1)
+	return nil, fmt.Errorf("server ignored the range: %w", ErrFatal)
 }

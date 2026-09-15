@@ -3,6 +3,7 @@ package xfer
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -369,5 +370,76 @@ func TestFetcherReturnsTheRequestedSlice(t *testing.T) {
 	}
 	if !bytes.Equal(got, data[100:200]) {
 		t.Error("Fetch returned the wrong bytes")
+	}
+}
+
+func TestGetRecoversFromAServerThatLiesAboutRanges(t *testing.T) {
+	// Real behaviour observed from cdn.jsdelivr.net: it answers 206 and reports
+	// a Content-Range total that is the *compressed* length, then sends the
+	// whole *uncompressed* body. Trusting either half alone corrupts the file,
+	// so braid must notice and fall back to a single stream.
+	data := payload(9000)
+	const liedSize = 1500
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hdr := r.Header.Get("Range")
+		switch {
+		case hdr == "bytes=0-0":
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", liedSize))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(data[:1])
+		case hdr != "":
+			// Claims a slice, sends everything.
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", liedSize-1, liedSize))
+			w.WriteHeader(http.StatusPartialContent)
+			w.Write(data)
+		default:
+			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(data)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	out, err := Get(context.Background(), baseOpts(srv.URL+"/liar.js", dir, loopbackLinks("a", "b")))
+	if err != nil {
+		t.Fatalf("Get should recover from a lying server: %v", err)
+	}
+	if out.Ranges {
+		t.Error("Ranges = true; a server caught lying must be reported as unsplittable")
+	}
+
+	got, err := os.ReadFile(out.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("recovered file is wrong: got %d bytes, want %d", len(got), len(data))
+	}
+	if out.Size != int64(len(data)) {
+		t.Errorf("Size = %d, want the true %d, not the advertised %d", out.Size, len(data), liedSize)
+	}
+	if _, err := os.Stat(out.Path + sidecarExt); !os.IsNotExist(err) {
+		t.Error("sidecar should not survive the fallback")
+	}
+}
+
+func TestFetcherFlagsAnOverlongBody(t *testing.T) {
+	data := payload(5000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-99/100")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data) // far more than the 100 bytes promised
+	}))
+	defer srv.Close()
+
+	f := &httpFetcher{client: &http.Client{}, url: srv.URL}
+	_, err := f.Fetch(context.Background(), 0, 99)
+	if err == nil {
+		t.Fatal("an over-long body must be an error")
+	}
+	if !errors.Is(err, ErrRangeIgnored) {
+		t.Errorf("error should wrap ErrRangeIgnored so the caller can fall back, got %v", err)
 	}
 }

@@ -22,6 +22,13 @@ import (
 // sidecarExt is appended to the output path to hold resume state.
 const sidecarExt = ".braid"
 
+// ErrRangeIgnored means a server answered 206 but did not honour the range it
+// promised. Observed in the wild from cdn.jsdelivr.net, which reports the
+// compressed length in Content-Range and then sends the whole uncompressed
+// body. Splitting such a response corrupts the file, so the transfer falls
+// back to a single stream.
+var ErrRangeIgnored = errors.New("server answered 206 but ignored the byte range")
+
 const (
 	defaultWorkersPerLink = 4
 	probeTimeout          = 30 * time.Second
@@ -113,15 +120,7 @@ func Get(ctx context.Context, o Options) (Outcome, error) {
 	if !info.Ranges {
 		// The server ignored the Range header, so there is nothing to split.
 		// One stream on one link, reported honestly rather than pretending.
-		n, err := singleStream(ctx, clients[0].client, info.URL, f)
-		if err != nil {
-			return out, err
-		}
-		out.Result = sched.Result{
-			Bytes:  n,
-			ByLink: map[string]int{clients[0].link.Iface: 1},
-		}
-		return out, f.Sync()
+		return fallback(ctx, clients[0], info.URL, f, out)
 	}
 
 	p := plan.New(info.Size, o.ChunkSize)
@@ -167,6 +166,15 @@ func Get(ctx context.Context, o Options) (Outcome, error) {
 	res, runErr := sched.Run(ctx, cfg)
 	out.Result = res
 
+	if errors.Is(runErr, ErrRangeIgnored) {
+		// The server promised slices and sent whole bodies. Nothing fetched so
+		// far can be trusted, so discard it and take the one path that yields a
+		// correct file.
+		os.Remove(sidecar)
+		out.Ranges = false
+		out.Resumed = false
+		return fallback(ctx, clients[0], info.URL, f, out)
+	}
 	if runErr != nil {
 		// Keep the sidecar: it is what makes the next attempt cheap.
 		current.Bits = bits.Bytes()
@@ -240,6 +248,24 @@ func destPath(dest, filename string) (string, error) {
 	return dest, nil
 }
 
+// fallback downloads the whole file over one link and reports the length that
+// actually arrived. A server that misreports a range usually misreports its
+// length too, so the file is sized to what was received, never to what was
+// advertised.
+func fallback(ctx context.Context, c linkClient, url string, f *os.File, out Outcome) (Outcome, error) {
+	n, err := singleStream(ctx, c.client, url, f)
+	if err != nil {
+		return out, err
+	}
+	if err := f.Truncate(n); err != nil {
+		return out, fmt.Errorf("resizing %s to the %d bytes received: %w", out.Path, n, err)
+	}
+	out.Size = n
+	out.Ranges = false
+	out.Result = sched.Result{Bytes: n, ByLink: map[string]int{c.link.Iface: 1}}
+	return out, f.Sync()
+}
+
 func singleStream(ctx context.Context, client *http.Client, url string, w io.WriterAt) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -308,7 +334,16 @@ func (f *httpFetcher) Fetch(ctx context.Context, start, end int64) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(body)) != want {
+	switch {
+	case int64(len(body)) > want:
+		// More than we asked for means the range was not honoured, whatever
+		// the status line claimed. Retrying cannot help; the caller must stop
+		// splitting this URL.
+		// Wraps sched.ErrFatal too, so the scheduler stops instead of
+		// re-downloading the whole file on every retry.
+		return nil, fmt.Errorf("chunk %d-%d: got at least %d bytes for a %d byte range: %w: %w",
+			start, end, len(body), want, ErrRangeIgnored, sched.ErrFatal)
+	case int64(len(body)) < want:
 		return nil, fmt.Errorf("chunk %d-%d: got %d bytes, want %d", start, end, len(body), want)
 	}
 	return body, nil
