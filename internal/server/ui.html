@@ -168,6 +168,15 @@
 
   .empty { color: var(--ink-soft); padding: 30px 0 4px; max-width: 46ch; }
   .note { margin-top: 12px; font-size: 13px; color: var(--ink-faint); min-height: 1.4em; }
+  /* Chrome withholds the clipboard API on a plain-http origin, which is exactly
+     how an Android phone reaches this page over the LAN. The link then has to be
+     selected by hand, so it gets room to breathe and a hint. */
+  .note.manual {
+    color: var(--ink); font-size: 14px; background: var(--surface);
+    border: 1px solid var(--rule); border-radius: var(--radius);
+    padding: 12px 14px; overflow-wrap: anywhere; user-select: all;
+  }
+  .note.manual b { display: block; font-weight: 500; color: var(--ink-soft); font-size: 13px; margin-bottom: 6px; user-select: none; }
   .failed { color: var(--cost-2); font-weight: 500; }
 
   @media (prefers-reduced-motion: reduce) {
@@ -447,16 +456,26 @@
 
   document.getElementById("copy").addEventListener("click", function () {
     var raw = document.getElementById("url").value.trim();
-    if (!raw) { note.textContent = "Paste a link first."; return; }
+    if (!raw) { note.className = "note"; note.textContent = "Paste a link first."; return; }
     var link = withToken("/stream?url=" + encodeURIComponent(raw));
-    var say = function (msg) { note.textContent = msg; };
+    var copied = function () {
+      note.className = "note";
+      note.textContent = "Copied. Open it in VLC, Infuse, or any browser on your network.";
+    };
+    var manual = function () {
+      // No clipboard API, so hand over something easy to select instead of a
+      // faint one-liner the user has to fight with.
+      note.className = "note manual";
+      note.textContent = "";
+      var hint = document.createElement("b");
+      hint.textContent = "Press and hold to copy this link:";
+      note.appendChild(hint);
+      note.appendChild(document.createTextNode(link));
+    };
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(link).then(
-        function () { say("Copied. Open it in VLC, Infuse, or any browser on your network."); },
-        function () { say(link); }
-      );
+      navigator.clipboard.writeText(link).then(copied, manual);
     } else {
-      say(link);
+      manual();
     }
   });
 
