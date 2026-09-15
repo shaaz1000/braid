@@ -117,7 +117,7 @@ struct DashboardView: View {
         .foregroundStyle(Theme.ink)
         .overlay(alignment: .top) { if dropping { dropHint } }
         .sheet(item: $playing) { url in
-            VideoPlayer(player: AVPlayer(url: url)).frame(minWidth: 780, minHeight: 470)
+            PlayerSheet(url: url) { playing = nil }
         }
         .onDrop(of: [.url, .text], isTargeted: $dropping) { providers in
             guard let provider = providers.first else { return false }
@@ -300,4 +300,50 @@ struct DashboardView: View {
 
 extension URL: Identifiable {
     public var id: String { absoluteString }
+}
+
+/// PlayerSheet wraps AppKit's AVPlayerView rather than SwiftUI's VideoPlayer.
+///
+/// SwiftUI's VideoPlayer crashed this app at launch — a Swift metadata fatal
+/// error inside _AVKit_SwiftUI while building the sheet's type metadata, long
+/// before anything was played. AVPlayerView never loads that interop module.
+struct PlayerSheet: View {
+    let url: URL
+    let close: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PlayerView(url: url)
+                .frame(minWidth: 780, minHeight: 440)
+            HStack {
+                Text(url.host ?? "").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Done", action: close).keyboardShortcut(.defaultAction)
+            }
+            .padding(12)
+        }
+    }
+}
+
+struct PlayerView: NSViewRepresentable {
+    let url: URL
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.controlsStyle = .inline
+        view.showsFullScreenToggleButton = true
+        let player = AVPlayer(url: url)
+        view.player = player
+        player.play()
+        return view
+    }
+
+    func updateNSView(_ view: AVPlayerView, context: Context) {}
+
+    static func dismantleNSView(_ view: AVPlayerView, coordinator: ()) {
+        // Without this the stream keeps being pulled after the sheet closes,
+        // which on a metered link is money.
+        view.player?.pause()
+        view.player = nil
+    }
 }

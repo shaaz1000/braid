@@ -19,8 +19,12 @@ final class Daemon: ObservableObject {
     private var stopping = false
     private var restarts = 0
 
+    /// The address is known as soon as a port is chosen. It must NOT depend on
+    /// `running`: the readiness check builds its URL from here, so requiring
+    /// `running` first made it impossible to ever become ready — every button
+    /// stayed disabled and the event stream never connected.
     var baseURL: URL? {
-        guard running, port > 0 else { return nil }
+        guard port > 0 else { return nil }
         return URL(string: "http://127.0.0.1:\(port)")
     }
 
