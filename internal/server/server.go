@@ -48,6 +48,10 @@ type Options struct {
 
 	// CacheLimit bounds the streamed-file cache. Zero means DefaultCacheLimit.
 	CacheLimit int64
+	// SpeedTestURL is the file the speed test pulls. Zero means
+	// DefaultSpeedTestURL. It must honour byte ranges or the test measures
+	// one link regardless of how many are attached.
+	SpeedTestURL string
 
 	Dialer         xfer.Dialer
 	ChunkSize      int64
@@ -116,6 +120,7 @@ func New(o Options) (*Server, error) {
 	}
 	s.mux.HandleFunc("/api/links", s.handleLinks)
 	s.mux.HandleFunc("/api/events", s.handleEvents)
+	s.mux.HandleFunc("/api/speedtest", s.handleSpeedTest)
 	s.mux.HandleFunc("/stream", s.handleStream)
 	s.mux.HandleFunc("/", s.handleUI)
 	return s, nil

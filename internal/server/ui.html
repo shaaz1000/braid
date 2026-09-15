@@ -208,6 +208,7 @@
     <input type="url" id="url" placeholder="Paste a link" required autocomplete="off" spellcheck="false">
     <button type="submit">Stream</button>
     <button type="button" class="ghost" id="copy">Copy link</button>
+    <button type="button" class="ghost" id="speed">Speed test</button>
   </form>
   <p class="note" id="note"></p>
 </main>
@@ -477,6 +478,42 @@
     } else {
       manual();
     }
+  });
+
+  // fast.com and every other speed test measures whichever single route macOS
+  // picks, so none of them can ever show a bonded figure. This measures braid.
+  document.getElementById("speed").addEventListener("click", function (ev) {
+    var btn = ev.currentTarget;
+    btn.disabled = true;
+    note.className = "note";
+    note.textContent = "Measuring over every uplink…";
+
+    fetch(withToken("/api/speedtest"), { method: "POST" })
+      .then(function (r) {
+        if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.status); });
+        return r.json();
+      })
+      .then(function (d) {
+        var parts = Object.keys(d.per_link)
+          .sort(function (a, b) { return d.per_link[b] - d.per_link[a]; })
+          .map(function (k) {
+            return (d.labels[k] || k) + " " + Math.round(d.per_link[k] * 100) + "%";
+          });
+        note.className = "note manual";
+        note.textContent = "";
+        var head = document.createElement("b");
+        head.textContent = d.mbps.toFixed(1) + " Mbps over " + d.links +
+          (d.links === 1 ? " uplink" : " uplinks");
+        note.appendChild(head);
+        note.appendChild(document.createTextNode(
+          parts.join("  ·  ") + "   (" + bytes(d.bytes) + " in " + d.seconds.toFixed(1) + "s)"
+        ));
+      })
+      .catch(function (e) {
+        note.className = "note";
+        note.textContent = "Speed test failed: " + e.message;
+      })
+      .finally(function () { btn.disabled = false; });
   });
 
   var es = new EventSource(withToken("/api/events"));
