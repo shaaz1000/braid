@@ -311,39 +311,89 @@ struct PlayerSheet: View {
     let url: URL
     let close: () -> Void
 
+    @StateObject private var model = PlayerModel()
+
     var body: some View {
         VStack(spacing: 0) {
-            PlayerView(url: url)
-                .frame(minWidth: 780, minHeight: 440)
+            ZStack {
+                Color.black
+                PlayerView(model: model)
+                if let problem = model.problem {
+                    // Playing something that is not video used to show a black
+                    // rectangle and nothing else, which reads as "broken app"
+                    // rather than "wrong link".
+                    VStack(spacing: 10) {
+                        Text("This link will not play")
+                            .font(.system(size: 16, weight: .medium))
+                        Text(problem)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 460)
+                        Text("Downloading it still works — only playback needs a video file.")
+                            .font(.system(size: 12)).foregroundStyle(.tertiary)
+                    }
+                    .padding(28)
+                }
+            }
+            .frame(minWidth: 780, minHeight: 440)
+
             HStack {
-                Text(url.host ?? "").font(.caption).foregroundStyle(.secondary)
+                Text(url.lastPathComponent).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
                 Button("Done", action: close).keyboardShortcut(.defaultAction)
             }
             .padding(12)
         }
+        .onAppear { model.load(url) }
+        .onDisappear { model.stop() }
+    }
+}
+
+/// PlayerModel owns the player and, crucially, surfaces failures. AVPlayer
+/// reports a bad asset by quietly doing nothing, which is the worst possible
+/// feedback.
+@MainActor
+final class PlayerModel: ObservableObject {
+    @Published var problem: String?
+    let player = AVPlayer()
+
+    private var observation: NSKeyValueObservation?
+
+    func load(_ url: URL) {
+        problem = nil
+        let item = AVPlayerItem(url: url)
+        observation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+            Task { @MainActor in
+                guard item.status == .failed else { return }
+                let reason = item.error?.localizedDescription
+                    ?? "The file is not a format this player understands."
+                self?.problem = reason
+            }
+        }
+        player.replaceCurrentItem(with: item)
+        player.play()
+    }
+
+    func stop() {
+        // Without this a closed sheet keeps pulling the stream, which on a
+        // metered link is money.
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        observation = nil
     }
 }
 
 struct PlayerView: NSViewRepresentable {
-    let url: URL
+    let model: PlayerModel
 
     func makeNSView(context: Context) -> AVPlayerView {
         let view = AVPlayerView()
         view.controlsStyle = .inline
         view.showsFullScreenToggleButton = true
-        let player = AVPlayer(url: url)
-        view.player = player
-        player.play()
+        view.player = model.player
         return view
     }
 
     func updateNSView(_ view: AVPlayerView, context: Context) {}
-
-    static func dismantleNSView(_ view: AVPlayerView, coordinator: ()) {
-        // Without this the stream keeps being pulled after the sheet closes,
-        // which on a metered link is money.
-        view.player?.pause()
-        view.player = nil
-    }
 }

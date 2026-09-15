@@ -33,6 +33,7 @@ get flags:
   -o <path>       output directory or file path (default: current directory)
   -chunk <bytes>  chunk size (default 4194304)
   -workers <n>    concurrent fetches per link (default 4)
+  -only <iface>   use just one uplink, e.g. -only en0 to avoid mobile data
   -tail-steal     re-request a stalled chunk on an idle link near the end;
                   costs duplicate bytes on a metered link, so it is off by default
 
@@ -137,6 +138,7 @@ func cmdGet(args []string) error {
 	chunk := fs.Int64("chunk", 0, "chunk size in bytes")
 	workers := fs.Int("workers", 0, "concurrent fetches per link")
 	tailSteal := fs.Bool("tail-steal", false, "re-request a stalled chunk near the end")
+	only := fs.String("only", "", "use just this interface, e.g. en0 (useful to avoid spending mobile data)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -149,6 +151,18 @@ func cmdGet(args []string) error {
 	links, err := discover()
 	if err != nil {
 		return err
+	}
+	if *only != "" {
+		var kept []linkset.Link
+		for _, l := range links {
+			if l.Iface == *only {
+				kept = append(kept, l)
+			}
+		}
+		if len(kept) == 0 {
+			return fmt.Errorf("no uplink called %q; run `braid links` to see what is available", *only)
+		}
+		links = kept
 	}
 
 	// Ctrl-C should leave the sidecar in place so the transfer can resume,

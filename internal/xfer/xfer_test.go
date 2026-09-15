@@ -528,3 +528,54 @@ func TestStartOnAnUnsplittableURLStillServesTheFile(t *testing.T) {
 		t.Fatalf("Wait: %v", err)
 	}
 }
+
+func TestChunkPlanLeavesRoomForWorkStealing(t *testing.T) {
+	// Work stealing only works when chunks massively outnumber workers. With
+	// one chunk per worker the split is frozen at the start and the transfer
+	// waits for the slowest link: a 33.5 MB file at the 4 MB default gave 9
+	// chunks across 8 workers and measured 40.8 Mbps, against 93.1 for the
+	// fast link alone.
+	cases := []struct {
+		name  string
+		size  int64
+		links int
+	}{
+		{"small file", 8 << 20, 2},
+		{"the 33.5MB case that regressed", 35_109_201, 2},
+		{"medium file", 68_100_347, 2},
+		{"large file", 2 << 30, 2},
+		{"single link", 68_100_347, 1},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			chunk, workers := chunkPlan(c.size, c.links, 0)
+
+			if chunk < minChunk {
+				t.Errorf("chunk %d is below the %d floor; small chunks bleed a round trip each",
+					chunk, minChunk)
+			}
+			if chunk > maxChunk {
+				t.Errorf("chunk %d exceeds the %d ceiling", chunk, maxChunk)
+			}
+			if workers < 1 {
+				t.Fatalf("workers = %d", workers)
+			}
+
+			chunks := (c.size + chunk - 1) / chunk
+			total := int64(workers * c.links)
+			if chunks < total*2 {
+				t.Errorf("%d chunks across %d workers leaves nothing to steal; "+
+					"want at least twice as many chunks as workers", chunks, total)
+			}
+		})
+	}
+}
+
+func TestChunkPlanHonoursAnExplicitChunkSize(t *testing.T) {
+	// Someone passing -chunk means it, even if it is a poor choice.
+	chunk, _ := chunkPlan(68_100_347, 2, 1<<20)
+	if chunk != 1<<20 {
+		t.Errorf("chunk = %d, want the requested 1 MiB", chunk)
+	}
+}

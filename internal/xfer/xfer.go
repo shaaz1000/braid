@@ -38,7 +38,55 @@ const (
 	defaultWorkersPerLink = 4
 	probeTimeout          = 30 * time.Second
 	streamBufSize         = 256 << 10
+
+	// Chunk bounds. The floor exists because a connection issues one request
+	// at a time, so every chunk costs a round trip and small chunks bleed
+	// throughput. The ceiling exists so there are always enough chunks left
+	// for a fast link to steal.
+	minChunk int64 = 1 << 20
+	maxChunk int64 = 8 << 20
 )
+
+// chunkPlan picks a chunk size and a per-link worker count that leave room for
+// work stealing.
+//
+// Two forces pull against each other. Work stealing needs chunks to massively
+// outnumber workers, or the split freezes at the start and the whole transfer
+// waits for the slowest link — a 33.5 MB file at the old fixed 4 MB gave 9
+// chunks across 8 workers and measured 40.8 Mbps against 93.1 for the fast
+// link alone. But every chunk costs a round trip, so shrinking them without
+// limit bleeds throughput instead.
+//
+// So: size the chunk from the file, clamp it, then scale workers to whatever
+// the resulting chunk count can actually keep busy.
+func chunkPlan(size int64, links int, requested int64) (chunk int64, workersPerLink int) {
+	if links < 1 {
+		links = 1
+	}
+	if requested > 0 {
+		chunk = requested
+	} else {
+		chunk = size / 32
+		if chunk < minChunk {
+			chunk = minChunk
+		}
+		if chunk > maxChunk {
+			chunk = maxChunk
+		}
+	}
+
+	chunks := (size + chunk - 1) / chunk
+	// Four chunks per worker keeps the queue deep enough that a fast link can
+	// take well beyond its share without starving the pool.
+	workersPerLink = int(chunks / int64(links*4))
+	if workersPerLink < 1 {
+		workersPerLink = 1
+	}
+	if workersPerLink > defaultWorkersPerLink {
+		workersPerLink = defaultWorkersPerLink
+	}
+	return chunk, workersPerLink
+}
 
 // Dialer builds a transport pinned to one link and family. Injectable so the
 // transfer logic can be tested over loopback without real interfaces.
@@ -133,9 +181,14 @@ func Start(ctx context.Context, o Options) (*Transfer, error) {
 		return nil, fmt.Errorf("sizing %s: %w", path, err)
 	}
 
+	// Sized here rather than in prepare(), because it depends on how big the
+	// file turned out to be and how many links are actually usable.
+	chunk, workers := chunkPlan(info.Size, len(clients), o.ChunkSize)
+	o.ChunkSize, o.WorkersPerLink = chunk, workers
+
 	t := &Transfer{
 		Info:    info,
-		Plan:    plan.New(info.Size, o.ChunkSize),
+		Plan:    plan.New(info.Size, chunk),
 		Path:    path,
 		opts:    o,
 		clients: clients,
@@ -347,12 +400,6 @@ func prepare(o Options) (Options, []linkClient, error) {
 	}
 	if o.Dialer == nil {
 		o.Dialer = dial.Transport
-	}
-	if o.ChunkSize <= 0 {
-		o.ChunkSize = plan.DefaultChunkSize
-	}
-	if o.WorkersPerLink <= 0 {
-		o.WorkersPerLink = defaultWorkersPerLink
 	}
 	clients, err := buildClients(o)
 	return o, clients, err
