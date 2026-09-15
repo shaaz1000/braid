@@ -1,0 +1,20 @@
+name: VPNProbe
+options:
+  bundleIdPrefix: com.shaazkhan
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  VPNProbe:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    entitlements:
+      path: probe.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.shaazkhan.braidvpnprobe
+        DEVELOPMENT_TEAM: GRFA8BR7C4
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        SWIFT_VERSION: "5.0"

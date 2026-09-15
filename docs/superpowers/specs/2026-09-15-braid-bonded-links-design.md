@@ -533,3 +533,53 @@ Deferred from this phase, and deliberately so:
   `constrained` flag) and reported, but nothing enforces a ceiling yet. Phase 1
   testing spent roughly 200 MB of real mobile data, which is precisely the
   argument for building it.
+
+### iOS findings, 2026-09-15 (iPhone 17 Pro Max, iOS 26.6.2)
+
+**App-level bonding works on iOS, with no entitlement.** `NWParameters`
+`requiredInterfaceType` is honoured: connections asked for `.cellular` reported
+`.cellular` and carried data while a Wi-Fi-pinned connection ran alongside,
+across three separate runs. `prohibitExpensivePaths` must be set false or iOS
+declines cellular while Wi-Fi is available.
+
+`URLSession` cannot do this. `allowsCellularAccess` only *forbids* cellular; it
+cannot require it, and iOS prefers Wi-Fi whenever Wi-Fi is up. Network.framework
+is the only route.
+
+| Run | Wi-Fi | Cellular | Together | Gain |
+|---|---|---|---|---|
+| 1 connection/link, 20 MB cap | 124.2 | 17.7 | — | unusable, see below |
+| 4 connections/link, tethered | 103.9 | 24.6 | 130.2 | +25% |
+| 4 connections/link, untethered | 78.7 | 14.6 | 87.0 | +11% |
+
+The gain is modest and noisy because this phone's cellular runs 15–30 Mbps
+against 80–100 Mbps of Wi-Fi — the opposite of the Mac, where the two links are
+near-parity and the gain is +71%. Unreconciled: the Mac measured 112.8 Mbps over
+this same phone's 5G hotspot the same day. A tethering-contention theory was
+tested and **disproved** — cellular was *slower* untethered, and Wi-Fi fell 25%
+in the same run, so conditions simply shift.
+
+Two measurement traps worth remembering, both of which produced confident
+nonsense before being fixed:
+
+- A 20 MB range cap let Wi-Fi finish in 1.29 s, so the "concurrent" phase was
+  mostly cellular alone and summing the two rates was meaningless.
+- One TCP stream cannot saturate a 5G radio: one read cellular at 17.7 Mbps
+  where four read 24.6. The engine uses many connections, so a one-stream spike
+  understates a link badly.
+
+**System-wide bonding on iOS is blocked on a free account.** Verified
+empirically rather than assumed: an app declaring
+`com.apple.developer.networking.networkextension` **builds and signs
+successfully**, and the entitlement is then **silently stripped** — the signed
+binary carries only `application-identifier`, `team-identifier` and
+`get-task-allow`, and the team provisioning profile grants no Network Extension
+key at all. The failure would surface only at runtime.
+
+A second, independent blocker: a bonding tunnel needs an endpoint reachable from
+*both* links, and a Mac on the LAN is unreachable from cellular behind carrier
+NAT. The tunnel genuinely requires a public server, as Phase 4 assumed.
+
+**Consequence for scope.** An iOS app can bond *its own* transfers (+11–25%
+here). It cannot make Safari, YouTube or any other app faster — iOS gives normal
+apps a single route and no setting changes that.
