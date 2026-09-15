@@ -3,6 +3,7 @@
 package plan
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -63,10 +64,18 @@ type Bitmap struct {
 	words []uint64
 	n     int
 	done  int
+	// changed is closed and replaced on every completed chunk. Waiters select
+	// on it alongside their context, which a sync.Cond cannot offer — and a
+	// reader whose client has hung up must not stay parked forever.
+	changed chan struct{}
 }
 
 func NewBitmap(n int) *Bitmap {
-	return &Bitmap{words: make([]uint64, (n+63)/64), n: n}
+	return &Bitmap{
+		words:   make([]uint64, (n+63)/64),
+		n:       n,
+		changed: make(chan struct{}),
+	}
 }
 
 // BitmapFromBytes restores a bitmap from its serialised form. Input shorter
@@ -92,7 +101,39 @@ func BitmapFromBytes(n int, b []byte) *Bitmap {
 func (b *Bitmap) Set(i int) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.set(i)
+	changed := b.set(i)
+	if changed {
+		// Wake every waiter. Each re-checks its own chunk and sleeps again if
+		// this was not the one it needed.
+		close(b.changed)
+		b.changed = make(chan struct{})
+	}
+	return changed
+}
+
+// WaitFor blocks until chunk i has landed, or ctx ends.
+//
+// This is what lets a client read a file in order while chunks arrive out of
+// order: the reader parks on the next byte it needs rather than polling.
+func (b *Bitmap) WaitFor(ctx context.Context, i int) error {
+	if i < 0 || i >= b.n {
+		return fmt.Errorf("chunk %d is outside a file of %d chunks", i, b.n)
+	}
+	for {
+		b.mu.Lock()
+		if b.words[i/64]&(1<<uint(i%64)) != 0 {
+			b.mu.Unlock()
+			return nil
+		}
+		changed := b.changed
+		b.mu.Unlock()
+
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // set is the unlocked core, for use during construction.

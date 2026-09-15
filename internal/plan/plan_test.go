@@ -1,9 +1,12 @@
 package plan
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestNewDividesEvenly(t *testing.T) {
@@ -269,5 +272,94 @@ func TestResumableAcceptsLastModifiedWhenNoETag(t *testing.T) {
 
 	if !saved.Resumable(remote) {
 		t.Error("matching Last-Modified and size should permit resume when neither side has an ETag")
+	}
+}
+
+func TestBitmapWaitForReturnsImmediatelyWhenAlreadySet(t *testing.T) {
+	b := NewBitmap(4)
+	b.Set(2)
+
+	if err := b.WaitFor(context.Background(), 2); err != nil {
+		t.Errorf("WaitFor on a set bit should return at once, got %v", err)
+	}
+}
+
+func TestBitmapWaitForBlocksUntilTheChunkLands(t *testing.T) {
+	// This is what lets a client read the file in order while chunks arrive out
+	// of order: the reader parks on the next byte it needs instead of polling.
+	b := NewBitmap(4)
+
+	done := make(chan error, 1)
+	go func() { done <- b.WaitFor(context.Background(), 3) }()
+
+	select {
+	case <-done:
+		t.Fatal("WaitFor returned before the chunk landed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	b.Set(3)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("WaitFor: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitFor did not wake when the chunk landed")
+	}
+}
+
+func TestBitmapWaitForWakesOnAnUnrelatedChunk(t *testing.T) {
+	// Chunks land in any order, so a waiter is woken by every Set and must go
+	// back to sleep unless its own chunk arrived.
+	b := NewBitmap(4)
+
+	done := make(chan error, 1)
+	go func() { done <- b.WaitFor(context.Background(), 1) }()
+
+	b.Set(0)
+	b.Set(2)
+	select {
+	case <-done:
+		t.Fatal("WaitFor returned for chunk 1 when only 0 and 2 landed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	b.Set(1)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("WaitFor: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitFor did not wake for its own chunk")
+	}
+}
+
+func TestBitmapWaitForHonoursContextCancellation(t *testing.T) {
+	// A client that closes the connection must not leave a goroutine parked
+	// forever on a chunk nobody is fetching any more.
+	b := NewBitmap(4)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() { done <- b.WaitFor(ctx, 3) }()
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitFor ignored cancellation")
+	}
+}
+
+func TestBitmapWaitForRejectsAnImpossibleChunk(t *testing.T) {
+	b := NewBitmap(4)
+	if err := b.WaitFor(context.Background(), 99); err == nil {
+		t.Fatal("waiting for a chunk outside the file must error, not block forever")
 	}
 }
