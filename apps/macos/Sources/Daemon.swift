@@ -14,6 +14,10 @@ final class Daemon: ObservableObject {
     private(set) var token: String = ""
 
     private var process: Process?
+    /// Distinguishes a deliberate shutdown from a crash, so only the crash is
+    /// worth recovering from.
+    private var stopping = false
+    private var restarts = 0
 
     var baseURL: URL? {
         guard running, port > 0 else { return nil }
@@ -32,6 +36,7 @@ final class Daemon: ObservableObject {
 
     func start() {
         guard process == nil else { return }
+        stopping = false
 
         guard let exec = Bundle.main.url(forResource: "braid-engine", withExtension: nil) else {
             failure = "The download engine is missing from the app bundle."
@@ -47,15 +52,32 @@ final class Daemon: ObservableObject {
 
         let p = Process()
         p.executableURL = exec
-        p.arguments = ["serve", "-port", String(port), "-token", token, "-cache", cache.path]
+        // The engine exits on its own if this app is force-quit, which a
+        // termination handler would never get to do. Without it, engines pile
+        // up holding ports and still downloading.
+        p.arguments = [
+            "serve", "-port", String(port), "-token", token, "-cache", cache.path,
+            "-watch-parent", String(ProcessInfo.processInfo.processIdentifier),
+        ]
         p.standardOutput = Pipe()
         p.standardError = Pipe()
         p.terminationHandler = { [weak self] proc in
             Task { @MainActor in
-                self?.running = false
-                self?.process = nil
-                if proc.terminationStatus != 0 {
-                    self?.failure = "The download engine stopped unexpectedly (code \(proc.terminationStatus))."
+                guard let self else { return }
+                self.running = false
+                self.process = nil
+                guard !self.stopping else { return }
+
+                // The engine died on its own. Sitting there dead with a window
+                // full of zeroes is the worst outcome, so bring it back — but
+                // bounded, or a genuinely broken engine becomes a restart loop.
+                if self.restarts < 5 {
+                    self.restarts += 1
+                    self.failure = "Restarting the download engine…"
+                    try? await Task.sleep(nanoseconds: 600_000_000)
+                    self.start()
+                } else {
+                    self.failure = "The download engine keeps stopping (code \(proc.terminationStatus))."
                 }
             }
         }
@@ -78,6 +100,7 @@ final class Daemon: ObservableObject {
                (resp as? HTTPURLResponse)?.statusCode == 200 {
                 running = true
                 failure = nil
+                restarts = 0
                 return
             }
             try? await Task.sleep(nanoseconds: 150_000_000)
@@ -86,6 +109,7 @@ final class Daemon: ObservableObject {
     }
 
     func stop() {
+        stopping = true
         process?.terminate()
         process = nil
         running = false

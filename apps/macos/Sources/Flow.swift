@@ -1,129 +1,132 @@
 import SwiftUI
 
-/// Flow is the hero: two streams of light entering from the left, braiding
-/// together in the middle, leaving as one.
+/// Flow is the hero: one ribbon per uplink, entering from the left, weaving
+/// over and under each other, leaving as a single braided cord.
 ///
-/// Every number on screen is a description of the transfer. This is the
-/// transfer — particle density per lane is that link's real share, and the
-/// whole thing flows at the measured rate, so a fast bonded download visibly
-/// races and a stalled one visibly stops.
+/// It is not decoration. Ribbon thickness is that link's real share of the
+/// work, light travels along it at the measured rate, and a link that stops
+/// carrying data visibly thins and dims. A glance answers "is bonding working,
+/// and which link is doing it" without reading a number.
 struct Flow: View {
     let links: [LinkInfo]
-    /// Live share of throughput per interface, 0...1, summing to roughly 1.
     let shares: [String: Double]
-    /// Total megabits per second, used to set how fast the light travels.
     let mbps: Double
     let active: Bool
 
-    private let particlesPerLane = 26
-
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !active)) { timeline in
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: false)) { timeline in
             Canvas { context, size in
                 let t = timeline.date.timeIntervalSinceReferenceDate
-                draw(in: &context, size: size, time: t)
+                draw(&context, size: size, time: t)
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(
-                    LinearGradient(
+                    RadialGradient(
                         colors: [Theme.surface, Theme.ground],
-                        startPoint: .topLeading, endPoint: .bottomTrailing
+                        center: .center, startRadius: 4, endRadius: 520
                     )
                 )
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(Theme.rule, lineWidth: 1)
         )
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
-    private func draw(in context: inout GraphicsContext, size: CGSize, time: Double) {
-        let lanes = links.isEmpty ? [LinkInfo(iface: "none", label: "—", metered: false)] : links
-        // Light moves faster when the transfer does, but the mapping is
-        // compressed so a 200 Mbps run is lively rather than a blur.
-        let speed = 0.06 + min(1.4, pow(max(0, mbps) / 120.0, 0.65)) * 0.5
-        let mergeX = size.width * 0.42
-        let exitX = size.width
+    private func draw(_ context: inout GraphicsContext, size: CGSize, time: Double) {
+        let lanes = links.isEmpty
+            ? [LinkInfo(iface: "idle", label: "—", metered: false)]
+            : links
+        // Idle still breathes, so the panel never looks dead or frozen.
+        let rate = active ? max(mbps, 4) : 5
+        let travel = time * (0.16 + min(1.1, pow(rate / 130.0, 0.6)))
+        let mergeX = size.width * 0.34
+        let mid = size.height / 2
 
-        drawChannel(&context, size: size, mergeX: mergeX)
+        for (i, link) in lanes.enumerated() {
+            let share = links.isEmpty ? 0.5 : (shares[link.iface] ?? 0.12)
+            let colour = links.isEmpty
+                ? Theme.inkFaint
+                : Theme.colour(for: link.iface, links: links)
 
-        for (laneIndex, link) in lanes.enumerated() {
-            let share = shares[link.iface] ?? (active ? 0 : 0.5)
-            // A link doing nothing still shows a thin trickle, so the lane
-            // reads as present-but-idle rather than missing.
-            let count = max(2, Int(Double(particlesPerLane) * max(0.08, share)))
-            let colour = Theme.colour(for: link.iface, links: links)
-            let laneY = laneCentre(laneIndex: laneIndex, count: lanes.count, height: size.height)
+            // Thickness is the link's share, with a floor so an idle link is
+            // still visibly present rather than gone.
+            let weight = 4.0 + share * 26.0
+            let path = strand(size: size, laneIndex: i, laneCount: lanes.count,
+                              mergeX: mergeX, mid: mid, time: time)
 
-            for i in 0 ..< count {
-                let offset = Double(i) / Double(count)
-                let phase = (time * speed + offset).truncatingRemainder(dividingBy: 1.0)
-                let x = phase * exitX
+            // Glow underneath, so the cord reads as light rather than a line.
+            context.stroke(path, with: .color(colour.opacity(active ? 0.16 : 0.09)),
+                           style: StrokeStyle(lineWidth: weight * 2.6, lineCap: .round))
+            context.stroke(path, with: .color(colour.opacity(active ? 0.42 : 0.26)),
+                           style: StrokeStyle(lineWidth: weight, lineCap: .round))
 
-                let y: CGFloat
-                if x < mergeX {
-                    // Approaching: slide toward the centre line.
-                    let k = CGFloat(x / mergeX)
-                    y = laneY + (size.height / 2 - laneY) * easeInOut(k)
-                } else {
-                    // Braided: cross over the centre, each lane in antiphase so
-                    // the strands visibly interleave.
-                    let k = Double((x - mergeX) / (exitX - mergeX))
-                    let swing = sin(k * .pi * 3 + Double(laneIndex) * .pi) * Double(size.height * 0.17)
-                    y = size.height / 2 + CGFloat(swing)
-                }
+            // Light running along the cord. A dashed stroke with a moving phase
+            // gives motion far more cheaply than hundreds of particles.
+            let dash = StrokeStyle(
+                lineWidth: weight * 0.66,
+                lineCap: .round,
+                dash: [10, 30],
+                dashPhase: -travel * 190
+            )
+            context.stroke(path, with: .color(colour.opacity(active ? 0.95 : 0.4)), style: dash)
+        }
 
-                let fade = phase > 0.92 ? (1 - (phase - 0.92) / 0.08) : 1
-                let radius: CGFloat = x < mergeX ? 2.6 : 3.2
-                let dot = Path(ellipseIn: CGRect(x: x - radius, y: y - radius,
-                                                 width: radius * 2, height: radius * 2))
-                context.fill(dot, with: .color(colour.opacity(0.85 * fade)))
-
-                // A soft trail, which reads as motion even in a still screenshot.
-                let trail = Path(ellipseIn: CGRect(x: x - radius * 3.2, y: y - radius * 0.7,
-                                                   width: radius * 3.4, height: radius * 1.4))
-                context.fill(trail, with: .color(colour.opacity(0.16 * fade)))
-            }
+        // Where the strands meet, a soft node: the moment of bonding.
+        if lanes.count > 1 {
+            let glow = Path(ellipseIn: CGRect(x: mergeX - 26, y: mid - 26, width: 52, height: 52))
+            context.fill(glow, with: .radialGradient(
+                Gradient(colors: [Theme.ink.opacity(active ? 0.20 : 0.10), .clear]),
+                center: CGPoint(x: mergeX, y: mid), startRadius: 0, endRadius: 26
+            ))
         }
     }
 
-    /// The channel the light travels along: two inlets that converge into one.
-    private func drawChannel(_ context: inout GraphicsContext, size: CGSize, mergeX: CGFloat) {
-        let lanes = max(1, links.count)
-        for laneIndex in 0 ..< lanes {
-            let laneY = laneCentre(laneIndex: laneIndex, count: lanes, height: size.height)
-            var path = Path()
-            path.move(to: CGPoint(x: 0, y: laneY))
-            path.addQuadCurve(to: CGPoint(x: mergeX, y: size.height / 2),
-                              control: CGPoint(x: mergeX * 0.62, y: laneY))
-            context.stroke(path, with: .color(Theme.rule.opacity(0.9)), lineWidth: 1)
+    /// strand is one uplink's path: in from its own lane, curving to the centre,
+    /// then weaving. Lanes are in antiphase so they cross over and under.
+    private func strand(size: CGSize, laneIndex: Int, laneCount: Int,
+                        mergeX: CGFloat, mid: CGFloat, time: Double) -> Path {
+        let laneY = laneCentre(laneIndex, laneCount, size.height)
+        var path = Path()
+        path.move(to: CGPoint(x: -6, y: laneY))
+        path.addCurve(
+            to: CGPoint(x: mergeX, y: mid),
+            control1: CGPoint(x: mergeX * 0.45, y: laneY),
+            control2: CGPoint(x: mergeX * 0.72, y: mid)
+        )
+
+        // After the merge the strands braid: a slow travelling sine, each lane
+        // offset by half a turn so they interleave instead of overlapping.
+        let amplitude = size.height * 0.17
+        let phase = time * 0.9 + Double(laneIndex) * .pi
+        let steps = 90
+        for s in 0 ... steps {
+            let k = Double(s) / Double(steps)
+            let x = mergeX + (size.width - mergeX) * k
+            // The weave tightens toward the exit, so the cord resolves into one.
+            let taper = 1.0 - k * 0.45
+            let y = mid + CGFloat(sin(k * .pi * 2.6 + phase) * Double(amplitude) * taper)
+            path.addLine(to: CGPoint(x: x, y: y))
         }
-        var trunk = Path()
-        trunk.move(to: CGPoint(x: mergeX, y: size.height / 2))
-        trunk.addLine(to: CGPoint(x: size.width, y: size.height / 2))
-        context.stroke(trunk, with: .color(Theme.rule.opacity(0.9)), lineWidth: 1)
+        return path
     }
 
-    private func laneCentre(laneIndex: Int, count: Int, height: CGFloat) -> CGFloat {
+    private func laneCentre(_ index: Int, _ count: Int, _ height: CGFloat) -> CGFloat {
         guard count > 1 else { return height / 2 }
-        let usable = height * 0.62
+        let usable = height * 0.66
         let top = (height - usable) / 2
-        return top + usable * CGFloat(laneIndex) / CGFloat(count - 1)
-    }
-
-    private func easeInOut(_ k: CGFloat) -> CGFloat {
-        k < 0.5 ? 2 * k * k : 1 - pow(-2 * k + 2, 2) / 2
+        return top + usable * CGFloat(index) / CGFloat(count - 1)
     }
 }
 
-/// Odometer rolls each digit into place instead of snapping, so a rising rate
-/// feels like it is climbing.
+/// Odometer rolls each digit into place, so a rising rate feels like climbing
+/// rather than flickering.
 struct Odometer: View {
     let value: Double
-    var size: CGFloat = 62
+    var size: CGFloat = 58
 
     private var text: String { String(format: "%.1f", max(0, value)) }
 
@@ -131,67 +134,103 @@ struct Odometer: View {
         HStack(spacing: 0) {
             ForEach(Array(text.enumerated()), id: \.offset) { _, ch in
                 if ch == "." {
-                    Text(".").font(.system(size: size, weight: .medium))
-                        .frame(width: size * 0.26)
+                    Text(".").font(.system(size: size, weight: .semibold))
+                        .frame(width: size * 0.24)
                 } else {
-                    Digit(value: Int(String(ch)) ?? 0, size: size)
+                    Text(String(ch))
+                        .font(.system(size: size, weight: .semibold))
+                        .frame(width: size * 0.56)
+                        .contentTransition(.numericText(countsDown: false))
+                        .animation(.spring(response: 0.4, dampingFraction: 0.72), value: value)
                 }
             }
         }
         .monospacedDigit()
     }
-
-    private struct Digit: View {
-        let value: Int
-        let size: CGFloat
-
-        var body: some View {
-            Text("\(value)")
-                .font(.system(size: size, weight: .medium))
-                .frame(width: size * 0.58)
-                .contentTransition(.numericText(countsDown: false))
-                .animation(.spring(response: 0.45, dampingFraction: 0.75), value: value)
-        }
-    }
 }
 
-/// Sparkline scrolls the last minute of throughput, so you can see a link drop
-/// out or a transfer ramp up rather than only its current value.
+/// Sparkline scrolls the recent past, so a link dropping out or a transfer
+/// ramping up is visible rather than only its current value.
 struct Sparkline: View {
     let history: [Double]
     let colour: Color
 
     var body: some View {
-        GeometryReader { geo in
+        Canvas { context, size in
+            guard history.count > 1 else { return }
             let peak = max(history.max() ?? 1, 1)
-            Canvas { context, size in
-                guard history.count > 1 else { return }
-                let step = size.width / CGFloat(max(1, history.count - 1))
+            let step = size.width / CGFloat(max(1, history.count - 1))
 
-                var line = Path()
-                var fill = Path()
-                fill.move(to: CGPoint(x: 0, y: size.height))
-                for (i, v) in history.enumerated() {
-                    let x = CGFloat(i) * step
-                    let y = size.height - CGFloat(v / peak) * size.height
-                    if i == 0 { line.move(to: CGPoint(x: x, y: y)) } else { line.addLine(to: CGPoint(x: x, y: y)) }
-                    fill.addLine(to: CGPoint(x: x, y: y))
-                }
-                fill.addLine(to: CGPoint(x: size.width, y: size.height))
-                fill.closeSubpath()
-
-                context.fill(fill, with: .linearGradient(
-                    Gradient(colors: [colour.opacity(0.32), colour.opacity(0.02)]),
-                    startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height)
-                ))
-                context.stroke(line, with: .color(colour), lineWidth: 1.6)
+            var line = Path()
+            var fill = Path()
+            fill.move(to: CGPoint(x: 0, y: size.height))
+            for (i, v) in history.enumerated() {
+                let x = CGFloat(i) * step
+                let y = size.height - CGFloat(v / peak) * (size.height - 3) - 1.5
+                if i == 0 { line.move(to: CGPoint(x: x, y: y)) } else { line.addLine(to: CGPoint(x: x, y: y)) }
+                fill.addLine(to: CGPoint(x: x, y: y))
             }
-            .frame(width: geo.size.width, height: geo.size.height)
+            fill.addLine(to: CGPoint(x: size.width, y: size.height))
+            fill.closeSubpath()
+
+            context.fill(fill, with: .linearGradient(
+                Gradient(colors: [colour.opacity(0.35), colour.opacity(0.02)]),
+                startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height)
+            ))
+            context.stroke(line, with: .color(colour), lineWidth: 1.8)
         }
     }
 }
 
-/// Pulse makes a completed transfer announce itself once, rather than silently
+/// LinkCard gives each uplink a face: its colour, whether it costs money, and
+/// what it is contributing right now.
+struct LinkCard: View {
+    let link: LinkInfo
+    let share: Double
+    let bytes: Int64
+    let colour: Color
+    let idle: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Circle().fill(colour).frame(width: 9, height: 9)
+                    .shadow(color: colour.opacity(idle ? 0 : 0.8), radius: idle ? 0 : 5)
+                Text(link.label).font(.system(size: 14, weight: .medium))
+                Spacer()
+                if link.metered {
+                    Text("billed")
+                        .font(.system(size: 11, weight: .medium))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Theme.cost[0].opacity(0.18), in: Capsule())
+                        .foregroundStyle(Theme.cost[0])
+                }
+            }
+            Text(idle ? "—" : "\(Int(share * 100))%")
+                .font(.system(size: 26, weight: .semibold)).monospacedDigit()
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Theme.pending)
+                    Capsule().fill(colour)
+                        .frame(width: max(3, geo.size.width * share))
+                        .animation(.easeOut(duration: 0.4), value: share)
+                }
+            }
+            .frame(height: 5)
+            Text(idle ? "idle" : prettyBytes(bytes))
+                .font(.system(size: 12)).foregroundStyle(Theme.inkSoft)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(idle ? Theme.rule : colour.opacity(0.35), lineWidth: 1)
+        )
+    }
+}
+
+/// Pulse makes a finished transfer announce itself once rather than silently
 /// changing a label.
 struct Pulse: ViewModifier {
     let trigger: Bool
@@ -202,7 +241,7 @@ struct Pulse: ViewModifier {
             .scaleEffect(scale)
             .onChange(of: trigger) { _, now in
                 guard now else { return }
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.4)) { scale = 1.06 }
+                withAnimation(.spring(response: 0.26, dampingFraction: 0.38)) { scale = 1.07 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                     withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) { scale = 1 }
                 }

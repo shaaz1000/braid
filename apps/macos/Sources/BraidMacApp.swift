@@ -11,7 +11,7 @@ struct BraidMacApp: App {
             DashboardView()
                 .environmentObject(daemon)
                 .environmentObject(client)
-                .frame(minWidth: 620, minHeight: 620)
+                .frame(minWidth: 680, minHeight: 640)
                 .onAppear {
                     daemon.start()
                     client.connect(to: daemon)
@@ -19,14 +19,12 @@ struct BraidMacApp: App {
                 .onDisappear { daemon.stop() }
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 720, height: 780)
+        .defaultSize(width: 760, height: 700)
 
         // Live speed in the menu bar, because "is my cellular being spent right
         // now" is a glance question, not a window question.
         MenuBarExtra {
-            MenuBarPanel()
-                .environmentObject(daemon)
-                .environmentObject(client)
+            MenuBarPanel().environmentObject(client)
         } label: {
             MenuBarLabel().environmentObject(client)
         }
@@ -38,10 +36,9 @@ struct MenuBarLabel: View {
     @EnvironmentObject var client: Client
 
     var body: some View {
-        let active = client.transfers.last(where: { !$0.finished })
         HStack(spacing: 5) {
             Image(systemName: "point.3.filled.connected.trianglepath.dotted")
-            if let active {
+            if let active = client.transfers.last(where: { !$0.finished }) {
                 Text(String(format: "%.0f", active.mbps)).monospacedDigit()
             }
         }
@@ -55,7 +52,7 @@ struct MenuBarPanel: View {
         VStack(alignment: .leading, spacing: 12) {
             if let t = client.transfers.last {
                 Text(t.name).font(.headline).lineLimit(1)
-                Weave(owners: t.owners, links: client.links).frame(height: 26)
+                Weave(owners: t.owners, links: client.links).frame(height: 24)
                 HStack {
                     Text(String(format: "%.1f Mbps", t.mbps)).monospacedDigit()
                     Spacer()
@@ -94,104 +91,144 @@ struct DashboardView: View {
     @State private var urlText = ""
     @State private var note: String?
     @State private var playing: URL?
+    @State private var dropping = false
 
     private var latest: TransferInfo? { client.transfers.last }
+    private var bonded: Bool { client.links.count > 1 }
+    private var busy: Bool { latest.map { !$0.finished } ?? false }
 
     var body: some View {
         ZStack {
             Theme.ground.ignoresSafeArea()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    header
-                    hero
-                    ledger
-                    composer
-                    if let note {
-                        Text(note).font(.callout).foregroundStyle(Theme.inkSoft)
-                    }
-                    Spacer(minLength: 0)
+            VStack(alignment: .leading, spacing: 18) {
+                header
+                Flow(links: client.links, shares: shares(), mbps: latest?.mbps ?? 0, active: busy)
+                    .frame(height: 176)
+                rateRow
+                linkCards
+                if let t = latest, !t.owners.isEmpty {
+                    Weave(owners: t.owners, links: client.links).frame(height: 26)
                 }
-                .padding(26)
+                Spacer(minLength: 0)
+                composer
             }
+            .padding(24)
         }
         .foregroundStyle(Theme.ink)
+        .overlay(alignment: .top) { if dropping { dropHint } }
         .sheet(item: $playing) { url in
-            VideoPlayer(player: AVPlayer(url: url))
-                .frame(minWidth: 760, minHeight: 460)
+            VideoPlayer(player: AVPlayer(url: url)).frame(minWidth: 780, minHeight: 470)
         }
-        // Dropping a link is faster than pasting one.
-        .onDrop(of: [.url, .text], isTargeted: nil) { providers in
+        .onDrop(of: [.url, .text], isTargeted: $dropping) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                if let url { Task { @MainActor in urlText = url.absoluteString } }
+                if let url { Task { @MainActor in urlText = url.absoluteString; begin() } }
             }
             return true
         }
     }
 
+    // MARK: - header
+
     private var header: some View {
         HStack(alignment: .firstTextBaseline) {
-            Text("braid").font(.system(size: 26, weight: .semibold)).tracking(-0.5)
+            Text("braid").font(.system(size: 25, weight: .semibold)).tracking(-0.6)
+            Text(statusLine)
+                .font(.system(size: 13))
+                .foregroundStyle(bonded ? Theme.free[0] : Theme.inkSoft)
             Spacer()
-            HStack(spacing: 8) {
+            if let t = latest, t.finished, !t.cached {
+                Text("done in \(prettySeconds(t.seconds))")
+                    .font(.system(size: 13)).foregroundStyle(Theme.inkSoft)
+            }
+        }
+    }
+
+    private var statusLine: String {
+        if !daemon.running && client.links.isEmpty { return "starting the engine…" }
+        switch client.links.count {
+        case 0: return "no uplinks found"
+        case 1: return "one uplink — nothing to bond yet"
+        default: return "\(client.links.count) uplinks bonded"
+        }
+    }
+
+    // MARK: - rate
+
+    private var rateRow: some View {
+        HStack(alignment: .lastTextBaseline, spacing: 12) {
+            if let t = latest, t.cached {
+                Text(prettyBytes(t.size)).font(.system(size: 52, weight: .semibold)).tracking(-1.5)
+                Text("already here").font(.system(size: 17, weight: .medium)).foregroundStyle(Theme.inkSoft)
+            } else {
+                Odometer(value: latest?.mbps ?? 0).pulse(on: latest?.finished ?? false)
+                Text("Mbps").font(.system(size: 17, weight: .medium)).foregroundStyle(Theme.inkSoft)
+            }
+            Spacer()
+            Sparkline(history: client.history, colour: Theme.free[0])
+                .frame(width: 190, height: 42)
+        }
+        .overlay(alignment: .bottomLeading) {
+            Text(caption).font(.system(size: 13)).foregroundStyle(Theme.inkSoft)
+                .offset(y: 22).lineLimit(1)
+        }
+        .padding(.bottom, 20)
+    }
+
+    private var caption: String {
+        guard let t = latest else {
+            return bonded
+                ? "Paste or drop a link. braid pulls it over every uplink at once."
+                : "Tether a phone over USB, or plug in Ethernet, and braid will use both."
+        }
+        if let failed = t.failed, !failed.isEmpty { return failed }
+        if t.cached { return "\(t.name) — already on disk, nothing downloaded again." }
+        return "\(t.name) — \(prettyBytes(t.bytes)) of \(prettyBytes(t.size))"
+    }
+
+    // MARK: - links
+
+    private var linkCards: some View {
+        HStack(spacing: 12) {
+            if client.links.isEmpty {
+                Panel {
+                    Text(daemon.running ? "No uplinks found." : "Starting the engine…")
+                        .font(.system(size: 13)).foregroundStyle(Theme.inkSoft)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
                 ForEach(client.links) { link in
-                    Circle()
-                        .fill(Theme.colour(for: link.iface, links: client.links))
-                        .frame(width: 9, height: 9)
-                        .help(link.label + (link.metered ? " — billed" : ""))
+                    LinkCard(
+                        link: link,
+                        share: shares()[link.iface] ?? 0,
+                        bytes: Int64((shares()[link.iface] ?? 0) * Double(latest?.bytes ?? 0)),
+                        colour: Theme.colour(for: link.iface, links: client.links),
+                        idle: (shares()[link.iface] ?? 0) == 0
+                    )
                 }
-                Text(client.links.isEmpty
-                     ? (daemon.running ? "no uplinks" : "starting…")
-                     : "\(client.links.count) uplink\(client.links.count == 1 ? "" : "s")")
-                    .font(.callout).foregroundStyle(Theme.inkSoft)
+                if client.links.count == 1 {
+                    // An empty slot that says what to do, rather than a blank gap.
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Add a second uplink").font(.system(size: 14, weight: .medium))
+                        Text("Tether a phone over USB, or plug in Ethernet. braid picks it up on its own.")
+                            .font(.system(size: 12)).foregroundStyle(Theme.inkSoft)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [5, 4]))
+                            .foregroundStyle(Theme.rule)
+                    )
+                }
             }
         }
+        .frame(height: 124)
     }
 
-    /// The hero is the transfer itself: two streams of light entering, braiding,
-    /// leaving as one. Particle density per lane is that link's real share and
-    /// the flow speed is the measured rate, so it races when the download does.
-    private var hero: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Flow(links: client.links,
-                 shares: liveShares(),
-                 mbps: latest?.mbps ?? 0,
-                 active: latest.map { !$0.finished } ?? false)
-                .frame(height: 168)
-
-            HStack(alignment: .lastTextBaseline, spacing: 10) {
-                if let t = latest, t.cached {
-                    Text(prettyBytes(t.size))
-                        .font(.system(size: 54, weight: .medium)).tracking(-2)
-                    Text("already here").font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(Theme.inkSoft)
-                } else {
-                    Odometer(value: latest?.mbps ?? 0)
-                        .pulse(on: latest?.finished ?? false)
-                    Text("Mbps").font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(Theme.inkSoft)
-                }
-                Spacer()
-                Sparkline(history: client.history,
-                          colour: Theme.free[0])
-                    .frame(width: 168, height: 44)
-            }
-
-            Text(latest.map(subtitle) ?? (client.links.count > 1
-                 ? "Paste or drop a link and braid pulls it over every uplink at once."
-                 : "Only one uplink. Tether a phone over USB, or plug in Ethernet, to bond."))
-                .font(.callout).foregroundStyle(Theme.inkSoft)
-
-            if let t = latest, !t.owners.isEmpty {
-                Weave(owners: t.owners, links: client.links)
-                    .frame(height: 30)
-            }
-        }
-    }
-
-    /// liveShares is each link's fraction of the work so far, which drives how
-    /// dense that lane of light is.
-    private func liveShares() -> [String: Double] {
+    private func shares() -> [String: Double] {
         guard let t = latest, !t.owners.isEmpty else { return [:] }
         var counts: [String: Int] = [:]
         for o in t.owners where !o.isEmpty { counts[o, default: 0] += 1 }
@@ -200,126 +237,64 @@ struct DashboardView: View {
         return counts.mapValues { Double($0) / Double(total) }
     }
 
-    private func subtitle(for t: TransferInfo) -> String {
-        if let failed = t.failed, !failed.isEmpty { return failed }
-        if t.cached { return "\(t.name) — already on disk, nothing was downloaded again." }
-        let progress = "\(prettyBytes(t.bytes)) of \(prettyBytes(t.size))"
-        let time = t.finished ? "finished in \(prettySeconds(t.seconds))" : "\(prettySeconds(t.seconds)) elapsed"
-        return "\(t.name) — \(progress) · \(time)"
-    }
-
-    private var ledger: some View {
-        VStack(spacing: 0) {
-            ForEach(shares(), id: \.iface) { share in
-                VStack(alignment: .leading, spacing: 7) {
-                    HStack {
-                        Text(share.label).font(.body.weight(.medium))
-                        if share.metered {
-                            Text("\(prettyBytes(share.bytes)) billed")
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(Theme.cost[0])
-                        }
-                        Spacer()
-                        Text("\(Int(share.fraction * 100))%  ·  \(prettyBytes(share.bytes))")
-                            .font(.callout).monospacedDigit().foregroundStyle(Theme.inkSoft)
-                    }
-                    GeometryReader { geo in
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(Theme.pending)
-                            Capsule()
-                                .fill(Theme.colour(for: share.iface, links: client.links))
-                                .frame(width: max(2, geo.size.width * share.fraction))
-                                .animation(.easeOut(duration: 0.35), value: share.fraction)
-                        }
-                    }
-                    .frame(height: 6)
-                }
-                .padding(.vertical, 13)
-                Divider().overlay(Theme.rule)
-            }
-        }
-    }
-
-    private struct Share {
-        let iface: String
-        let label: String
-        let metered: Bool
-        let fraction: Double
-        let bytes: Int64
-    }
-
-    private func shares() -> [Share] {
-        guard let t = latest, !t.owners.isEmpty else { return [] }
-        var counts: [String: Int] = [:]
-        for owner in t.owners where !owner.isEmpty { counts[owner, default: 0] += 1 }
-        let total = counts.values.reduce(0, +)
-        guard total > 0 else { return [] }
-
-        return counts.map { iface, n in
-            let fraction = Double(n) / Double(total)
-            let link = client.links.first { $0.iface == iface }
-            return Share(
-                iface: iface,
-                label: link?.label ?? (iface == "resumed" ? "Already on disk" : iface),
-                metered: link?.metered ?? false,
-                fraction: fraction,
-                bytes: Int64(fraction * Double(t.bytes))
-            )
-        }
-        .sorted { $0.fraction > $1.fraction }
-    }
+    // MARK: - composer
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 9) {
-                TextField("Paste a link", text: $urlText)
+                TextField("Paste a link, or drop one anywhere", text: $urlText)
                     .textFieldStyle(.plain)
-                    .font(.body)
+                    .font(.system(size: 14))
                     .padding(11)
-                    .background(Theme.surface, in: RoundedRectangle(cornerRadius: 7))
-                    .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(Theme.rule))
-                    .onSubmit { begin() }
+                    .background(Theme.surface, in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.rule))
+                    .onSubmit(begin)
 
-                Button("Download") { begin() }
+                Button("Download", action: begin)
                     .buttonStyle(.borderedProminent)
                     .disabled(urlText.isEmpty || !daemon.running)
+                Button("Play", action: play)
+                    .disabled(urlText.isEmpty || !daemon.running)
+                Button("Copy link", action: copyLink)
+                    .disabled(urlText.isEmpty || !daemon.running)
             }
-
-            HStack(spacing: 9) {
-                Button("Play here") {
-                    guard let url = client.streamURL(for: urlText, on: daemon) else { return }
-                    playing = url
-                }
-                .disabled(urlText.isEmpty || !daemon.running)
-
-                Button("Copy link for other devices") {
-                    guard let url = client.streamURL(for: urlText, on: daemon) else { return }
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(url.absoluteString, forType: .string)
-                    note = "Copied. Paste it into VLC, Infuse, or a browser on this network."
-                }
-                .disabled(urlText.isEmpty || !daemon.running)
-
-                Spacer()
-                if let failure = daemon.failure {
-                    Text(failure).font(.callout).foregroundStyle(Theme.cost[1])
-                }
+            if let message = note ?? daemon.failure {
+                Text(message).font(.system(size: 12)).foregroundStyle(Theme.inkSoft).lineLimit(2)
             }
-            .buttonStyle(.bordered)
         }
     }
+
+    private var dropHint: some View {
+        Text("Drop to download over every uplink")
+            .font(.system(size: 13, weight: .medium))
+            .padding(.horizontal, 16).padding(.vertical, 10)
+            .background(Theme.free[0].opacity(0.9), in: Capsule())
+            .foregroundStyle(Theme.ground)
+            .padding(.top, 14)
+    }
+
+    // MARK: - actions
 
     private func begin() {
         let text = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         note = nil
         Task {
-            do {
-                try await client.start(text, on: daemon)
-            } catch {
-                note = error.localizedDescription
-            }
+            do { try await client.start(text, on: daemon) }
+            catch { note = error.localizedDescription }
         }
+    }
+
+    private func play() {
+        guard let url = client.streamURL(for: urlText, on: daemon) else { return }
+        playing = url
+    }
+
+    private func copyLink() {
+        guard let url = client.streamURL(for: urlText, on: daemon) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        note = "Copied. Paste it into VLC, Infuse, or a browser on this network."
     }
 }
 

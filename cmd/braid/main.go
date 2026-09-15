@@ -279,6 +279,7 @@ func cmdServe(args []string) error {
 	port := fs.Int("port", 8080, "port to listen on")
 	cache := fs.String("cache", "", "where streamed files are kept")
 	token := fs.String("token", "", "shared secret")
+	watchParent := fs.Int("watch-parent", 0, "exit when this process id goes away")
 	chunk := fs.Int64("chunk", 0, "chunk size in bytes")
 	workers := fs.Int("workers", 0, "concurrent fetches per link")
 	if err := fs.Parse(args); err != nil {
@@ -336,6 +337,13 @@ func cmdServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// A GUI wrapper that is force-quit never gets to shut its child down, so
+	// the engine would linger holding a port and possibly still downloading.
+	// Watching the parent means it cleans up after itself.
+	if *watchParent > 0 {
+		ctx = watchUntilParentExits(ctx, *watchParent)
+	}
+
 	errs := make(chan error, 1)
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -363,4 +371,28 @@ func discover2() []linkset.Link {
 		return nil
 	}
 	return links
+}
+
+// watchUntilParentExits cancels the returned context once pid is gone. Signal 0
+// does not deliver anything; it only reports whether the process can be
+// signalled, which is the cheap way to ask whether it still exists.
+func watchUntilParentExits(parent context.Context, pid int) context.Context {
+	ctx, cancel := context.WithCancel(parent)
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := syscall.Kill(pid, 0); err != nil {
+					fmt.Fprintf(os.Stderr, "parent %d is gone, shutting down\n", pid)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx
 }
