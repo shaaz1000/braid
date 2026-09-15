@@ -133,19 +133,20 @@ func TestMeteredFromFriendlyName(t *testing.T) {
 }
 
 func TestLinkFamiliesReportsOnlyWhatItHas(t *testing.T) {
-	// USB tethering gave no IPv6 at all on this Mac, while the same phone's
-	// Wi-Fi hotspot did. Nothing may assume dual-stack.
+	// A tether can offer IPv4 only for minutes before IPv6 appears, and a
+	// different tethering method offers a different set. Nothing may assume
+	// dual-stack.
 	v4only := Link{V4: addr("172.20.10.2")}
 	if got := v4only.Families(); len(got) != 1 || got[0] != Fam4 {
 		t.Errorf("v4-only families = %v, want [Fam4]", got)
 	}
 
-	v6only := Link{V6: addr("2001:db8::1")}
+	v6only := Link{V6: addr("2001:db8:1::1")}
 	if got := v6only.Families(); len(got) != 1 || got[0] != Fam6 {
 		t.Errorf("v6-only families = %v, want [Fam6]", got)
 	}
 
-	both := Link{V4: addr("192.168.1.42"), V6: addr("2001:db8::1")}
+	both := Link{V4: addr("192.168.1.42"), V6: addr("2001:db8:1::1")}
 	if got := both.Families(); len(got) != 2 {
 		t.Errorf("dual-stack families = %v, want 2", got)
 	}
