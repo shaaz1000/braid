@@ -1,0 +1,4 @@
+/braid
+/dist/
+*.braid
+.DS_Store
