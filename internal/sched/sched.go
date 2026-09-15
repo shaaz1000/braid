@@ -39,9 +39,10 @@ type Fetcher interface {
 
 // Link is one uplink and how many concurrent fetches to run on it.
 type Link struct {
-	Name    string
-	Fetcher Fetcher
-	Workers int
+	Name              string
+	Fetcher           Fetcher
+	Workers           int
+	MinUsefulFraction float64
 }
 
 // Progress is reported once per chunk successfully written.
@@ -101,6 +102,10 @@ const (
 	// the whole gain. Measured: cellular at 20 Mbps beside Wi-Fi at 87 was
 	// reduced to 0% of the work.
 	minRescueGain = 1200 * time.Millisecond
+	// A link below this fraction of the fastest observed link is unlikely to
+	// help: its first chunk becomes tail work that the fast link must fetch
+	// again. It is kept to one calibration request, then retired for this job.
+	minUsefulRateFraction = 0.20
 )
 
 func defaultBackoff(attempt int) time.Duration {
@@ -218,7 +223,7 @@ func runWorker(ctx context.Context, cfg Config, q *queue, l Link, mu *sync.Mutex
 		if cfg.Bits.Get(idx) {
 			// A tail-steal rival already finished this one; do not spend the
 			// bytes again.
-			q.release(idx)
+			q.release(idx, l.Name)
 			continue
 		}
 
@@ -248,13 +253,13 @@ func runWorker(ctx context.Context, cfg Config, q *queue, l Link, mu *sync.Mutex
 			// A cancelled job is not the link's fault; stop rather than
 			// burning this chunk's attempt budget.
 			if ctx.Err() != nil {
-				q.release(idx)
+				q.release(idx, l.Name)
 				return
 			}
 			// Nothing about this will improve on a second attempt, and each
 			// attempt may cost a whole file's worth of bytes.
 			if errors.Is(err, ErrFatal) {
-				q.release(idx)
+				q.release(idx, l.Name)
 				q.abort(fmt.Errorf("chunk %d on %s: %w", idx, l.Name, err))
 				return
 			}
@@ -278,7 +283,7 @@ func runWorker(ctx context.Context, cfg Config, q *queue, l Link, mu *sync.Mutex
 			// A tail-steal rival published first. Its bytes are identical to
 			// ours, so the duplicate write was harmless — but the chunk is not
 			// ours to count.
-			q.release(idx)
+			q.release(idx, l.Name)
 			continue
 		}
 
@@ -324,10 +329,15 @@ type queue struct {
 	// rates is each link's observed throughput in bytes per second, which is
 	// what turns rescuing from a guessed delay into arithmetic.
 	rates map[string]float64
+	// active counts leases per link. Until a link completes its calibration
+	// chunk, only one of its workers may consume data.
+	active map[string]int
+	seen   map[string]bool
 
 	attempts  map[chunkLink]int
 	linkFails map[string]int
 	liveLinks map[string]bool
+	minUseful map[string]float64
 
 	remaining        int
 	maxAttempts      int
@@ -342,16 +352,20 @@ func newQueue(cfg Config) *queue {
 		inflight:         map[int]time.Time{},
 		holder:           map[int]string{},
 		rates:            map[string]float64{},
+		active:           map[string]int{},
+		seen:             map[string]bool{},
 		stolen:           map[int]bool{},
 		attempts:         map[chunkLink]int{},
 		linkFails:        map[string]int{},
 		liveLinks:        map[string]bool{},
+		minUseful:        map[string]float64{},
 		maxAttempts:      cfg.MaxAttempts,
 		linkFailureLimit: cfg.LinkFailureLimit,
 	}
 	q.cond = sync.NewCond(&q.mu)
 	for _, l := range cfg.Links {
 		q.liveLinks[l.Name] = true
+		q.minUseful[l.Name] = l.MinUsefulFraction
 	}
 	for i := 0; i < cfg.Plan.Chunks; i++ {
 		if !cfg.Bits.Get(i) {
@@ -384,6 +398,24 @@ func (q *queue) next(link string, tailStealAfter time.Duration) (int, bool) {
 		if q.failErr != nil || q.remaining == 0 || !q.liveLinks[link] {
 			return 0, false
 		}
+		// Do not let every worker on an unmeasured link grab a large chunk. One
+		// request is enough to learn whether the link helps; the other workers
+		// wake when that calibration completes.
+		if q.rates[link] == 0 && q.active[link] > 0 {
+			q.cond.Wait()
+			continue
+		}
+		// Before any measured link takes a second chunk, give every link a
+		// chance to start its calibration request. This avoids goroutine
+		// scheduling accidentally letting one link drain a small transfer.
+		if q.seen[link] && q.hasUnstartedLinkLocked() {
+			q.cond.Wait()
+			continue
+		}
+		if q.tooSlowLocked(link) {
+			q.retireLocked(link)
+			return 0, false
+		}
 
 		// Prefer untried work, skipping chunks this link has already exhausted.
 		if idx, ok := q.takePendingFor(link); ok {
@@ -411,10 +443,40 @@ func (q *queue) takePendingFor(link string) (int, bool) {
 			q.pending = append(q.pending[:i], q.pending[i+1:]...)
 			q.inflight[idx] = time.Now()
 			q.holder[idx] = link
+			q.active[link]++
+			q.seen[link] = true
+			q.cond.Broadcast()
 			return idx, true
 		}
 	}
 	return 0, false
+}
+
+func (q *queue) hasUnstartedLinkLocked() bool {
+	for link, live := range q.liveLinks {
+		if live && !q.seen[link] {
+			return true
+		}
+	}
+	return false
+}
+
+func (q *queue) tooSlowLocked(link string) bool {
+	mine := q.rates[link]
+	if mine <= 0 {
+		return false
+	}
+	fastest := mine
+	for name, rate := range q.rates {
+		if q.liveLinks[name] && rate > fastest {
+			fastest = rate
+		}
+	}
+	fraction := q.minUseful[link]
+	if fraction <= 0 {
+		fraction = minUsefulRateFraction
+	}
+	return mine < fastest*fraction
 }
 
 // takeStealFor decides whether this worker should re-request a chunk someone
@@ -472,6 +534,7 @@ func (q *queue) takeStealFor(link string, floor time.Duration) (int, bool) {
 			q.stolen[idx] = true
 			q.tailSteals++
 			q.inflight[idx] = now
+			q.active[link]++
 			return idx, true
 		}
 	}
@@ -497,6 +560,9 @@ func (q *queue) completed(idx int, link string) {
 	}
 	delete(q.inflight, idx)
 	delete(q.holder, idx)
+	if q.active[link] > 0 {
+		q.active[link]--
+	}
 	q.linkFails[link] = 0
 	if q.remaining > 0 {
 		q.remaining--
@@ -506,11 +572,14 @@ func (q *queue) completed(idx int, link string) {
 
 // release gives a chunk back without blaming anyone: the caller lost a steal
 // race, or the job is shutting down.
-func (q *queue) release(idx int) {
+func (q *queue) release(idx int, link string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	delete(q.inflight, idx)
 	delete(q.holder, idx)
+	if q.active[link] > 0 {
+		q.active[link]--
+	}
 	q.cond.Broadcast()
 }
 
@@ -532,6 +601,9 @@ func (q *queue) failed(idx int, link string, cause error) int {
 
 	delete(q.inflight, idx)
 	delete(q.stolen, idx)
+	if q.active[link] > 0 {
+		q.active[link]--
+	}
 	q.requeueLocked(idx)
 
 	if !q.anyLinkCanTry(idx) {

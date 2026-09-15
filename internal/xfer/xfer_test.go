@@ -379,6 +379,41 @@ func TestFetcherReturnsTheRequestedSlice(t *testing.T) {
 	}
 }
 
+func TestFetcherRejectsMismatchedContentRange(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-99/300")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(make([]byte, 100))
+	}))
+	defer srv.Close()
+
+	f := &httpFetcher{client: &http.Client{}, url: srv.URL}
+	_, err := f.Fetch(context.Background(), 100, 199, newMemWriter(300))
+	if !errors.Is(err, ErrRangeIgnored) {
+		t.Fatalf("mismatched Content-Range error = %v, want ErrRangeIgnored", err)
+	}
+}
+
+func TestStartHonoursExplicitWorkerCount(t *testing.T) {
+	data := payload(1000)
+	srv := httptest.NewServer((&rangeServer{data: data, etag: `"v1"`}).handler())
+	defer srv.Close()
+
+	opts := baseOpts(srv.URL+"/workers.bin", t.TempDir(), loopbackLinks("a"))
+	opts.WorkersPerLink = 7
+	tr, err := Start(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer tr.Close()
+	if tr.opts.WorkersPerLink != 7 {
+		t.Errorf("WorkersPerLink = %d, want explicit value 7", tr.opts.WorkersPerLink)
+	}
+	if _, err := tr.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+}
+
 func TestGetRecoversFromAServerThatLiesAboutRanges(t *testing.T) {
 	// Real behaviour observed from cdn.jsdelivr.net: it answers 206 and reports
 	// a Content-Range total that is the *compressed* length, then sends the

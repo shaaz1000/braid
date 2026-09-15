@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -198,7 +200,12 @@ func Start(ctx context.Context, o Options) (*Transfer, error) {
 	// Sized here rather than in prepare(), because it depends on how big the
 	// file turned out to be and how many links are actually usable.
 	chunk, workers := chunkPlan(info.Size, len(clients), o.ChunkSize)
-	o.ChunkSize, o.WorkersPerLink = chunk, workers
+	o.ChunkSize = chunk
+	// A positive WorkersPerLink is an explicit caller choice (and is exposed
+	// as the CLI's -workers flag). Only use the adaptive value when omitted.
+	if o.WorkersPerLink <= 0 {
+		o.WorkersPerLink = workers
+	}
 
 	t := &Transfer{
 		Info:    info,
@@ -454,10 +461,17 @@ func buildClients(o Options) ([]linkClient, error) {
 func schedLinks(clients []linkClient, url string, workers int) []sched.Link {
 	out := make([]sched.Link, 0, len(clients))
 	for _, c := range clients {
+		minUseful := 0.0
+		if c.link.Metered {
+			// Cellular data should earn its place decisively: a marginally useful
+			// metered link is not worth duplicate tail bytes or a slower finish.
+			minUseful = 0.50
+		}
 		out = append(out, sched.Link{
-			Name:    c.link.Iface,
-			Fetcher: &httpFetcher{client: c.client, url: url},
-			Workers: workers,
+			Name:              c.link.Iface,
+			Fetcher:           &httpFetcher{client: c.client, url: url},
+			Workers:           workers,
+			MinUsefulFraction: minUseful,
 		})
 	}
 	return out
@@ -506,6 +520,14 @@ func (f *httpFetcher) Fetch(ctx context.Context, start, end int64, into io.Write
 	if resp.StatusCode != http.StatusPartialContent {
 		return 0, fmt.Errorf("chunk %d-%d: expected 206, got HTTP %d", start, end, resp.StatusCode)
 	}
+	gotStart, gotEnd, err := responseRange(resp.Header.Get("Content-Range"))
+	if err != nil {
+		return 0, fmt.Errorf("chunk %d-%d: %w", start, end, err)
+	}
+	if gotStart != start || gotEnd != end {
+		return 0, fmt.Errorf("chunk %d-%d: server returned bytes %d-%d: %w: %w",
+			start, end, gotStart, gotEnd, ErrRangeIgnored, sched.ErrFatal)
+	}
 
 	want := end - start + 1
 	buf := make([]byte, 128<<10)
@@ -540,4 +562,31 @@ func (f *httpFetcher) Fetch(ctx context.Context, start, end int64, into io.Write
 		return written, fmt.Errorf("chunk %d-%d: got %d bytes, want %d", start, end, written, want)
 	}
 	return written, nil
+}
+
+// responseRange parses the byte offsets from a 206 Content-Range. The total is
+// deliberately ignored here; the probe owns the file size, while every chunk
+// must prove it returned exactly the requested slice before bytes are trusted.
+func responseRange(v string) (int64, int64, error) {
+	unit, rest, ok := strings.Cut(strings.TrimSpace(v), " ")
+	if !ok || unit != "bytes" {
+		return 0, 0, fmt.Errorf("missing or malformed Content-Range %q", v)
+	}
+	rangePart, _, ok := strings.Cut(rest, "/")
+	if !ok {
+		return 0, 0, fmt.Errorf("malformed Content-Range %q", v)
+	}
+	from, to, ok := strings.Cut(rangePart, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("malformed Content-Range %q", v)
+	}
+	start, err := strconv.ParseInt(strings.TrimSpace(from), 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, fmt.Errorf("malformed Content-Range %q", v)
+	}
+	end, err := strconv.ParseInt(strings.TrimSpace(to), 10, 64)
+	if err != nil || end < start {
+		return 0, 0, fmt.Errorf("malformed Content-Range %q", v)
+	}
+	return start, end, nil
 }

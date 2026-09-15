@@ -198,6 +198,48 @@ func TestFastLinkTakesMoreChunksThanSlowLink(t *testing.T) {
 	}
 }
 
+func TestVerySlowLinkIsLimitedToCalibration(t *testing.T) {
+	data := source(4000)
+	p := plan.New(int64(len(data)), 100)
+	out := newSink(len(data))
+
+	fast := &fakeLink{data: data, delay: 2 * time.Millisecond}
+	slow := &fakeLink{data: data, delay: 80 * time.Millisecond}
+	res, err := Run(context.Background(), fastOpts(p, plan.NewBitmap(p.Chunks), out,
+		Link{Name: "fast", Fetcher: fast, Workers: 4},
+		Link{Name: "slow", Fetcher: slow, Workers: 4},
+	))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !bytes.Equal(out.bytes(), data) {
+		t.Fatal("output does not match the source")
+	}
+	if calls := slow.calls(); calls > 1 {
+		t.Errorf("very slow link made %d requests, want only its calibration request", calls)
+	}
+	if res.ByLink["fast"] <= res.ByLink["slow"] {
+		t.Errorf("fast link completed %d chunks, slow completed %d", res.ByLink["fast"], res.ByLink["slow"])
+	}
+}
+
+func TestLinkCanRequireAHigherUsefulRate(t *testing.T) {
+	data := source(4000)
+	p := plan.New(int64(len(data)), 100)
+	slower := &fakeLink{data: data, delay: 12 * time.Millisecond}
+
+	_, err := Run(context.Background(), fastOpts(p, plan.NewBitmap(p.Chunks), newSink(len(data)),
+		Link{Name: "fast", Fetcher: &fakeLink{data: data, delay: 4 * time.Millisecond}, Workers: 2},
+		Link{Name: "costly", Fetcher: slower, Workers: 2, MinUsefulFraction: 0.50},
+	))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls := slower.calls(); calls > 1 {
+		t.Errorf("costly slower link made %d requests, want only calibration", calls)
+	}
+}
+
 func TestChunksFromAFailingLinkAreCompletedByAnother(t *testing.T) {
 	data := source(800)
 	p := plan.New(int64(len(data)), 100)
