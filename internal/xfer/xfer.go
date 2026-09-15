@@ -70,14 +70,21 @@ func chunkPlan(size int64, links int, requested int64) (chunk int64, workersPerL
 		// it, and clamping it silently would make the flag a lie.
 		chunk = requested
 	} else {
-		chunk = maxChunk
-		// Only grow past the fixed size for files so large the block list
-		// would become unwieldy.
-		if grown := size / maxBlocks; grown > chunk {
-			chunk = grown
-		}
+		// Big enough that a round trip per chunk is noise, small enough that
+		// one chunk on the slow link is not the whole job. An 8 MB block at
+		// 20 Mbps takes 3.2s — on a 33 MB file that IS the job, so the slow
+		// link either strands it or gets everything rescued away and
+		// contributes nothing.
+		chunk = size / 16
 		if chunk < minChunk {
 			chunk = minChunk
+		}
+		if chunk > maxChunk {
+			chunk = maxChunk
+		}
+		// Safety valve for files so large the block list becomes unwieldy.
+		if grown := size / maxBlocks; grown > chunk {
+			chunk = grown
 		}
 	}
 

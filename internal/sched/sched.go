@@ -88,6 +88,12 @@ const (
 	// minUnmeasuredWait keeps a healthy link from being robbed the instant it
 	// picks up its first chunk, before it has had a chance to report a rate.
 	minUnmeasuredWait = 250 * time.Millisecond
+	// minRescueGain is the smallest delay worth rescuing. Without it, a link
+	// four times slower has EVERY chunk stolen the moment the fast link idles,
+	// so it contributes nothing at all — protecting the total by throwing away
+	// the whole gain. Measured: cellular at 20 Mbps beside Wi-Fi at 87 was
+	// reduced to 0% of the work.
+	minRescueGain = 1200 * time.Millisecond
 )
 
 func defaultBackoff(attempt int) time.Duration {
@@ -454,8 +460,10 @@ func (q *queue) takeStealFor(link string, floor time.Duration) (int, bool) {
 			remaining = elapsed // assume at least as long again
 		}
 
-		// Only worth it with a clear margin, or a near-tie causes churn.
-		if remaining > refetch*2 {
+		// Worth rescuing only if the wait is both clearly worse than refetching
+		// AND long enough to matter. A slow link that will finish its chunk
+		// shortly should be left alone to contribute.
+		if remaining > refetch*2 && remaining > minRescueGain {
 			q.stolen[idx] = true
 			q.tailSteals++
 			q.inflight[idx] = now

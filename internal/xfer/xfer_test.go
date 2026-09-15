@@ -573,10 +573,14 @@ func TestChunkPlanLeavesRoomForWorkStealing(t *testing.T) {
 			}
 			// Large chunks are the point: shrinking them to manufacture steal
 			// headroom cost more in round trips than it gained in balance.
-			if c.size >= maxChunk && chunk < maxChunk {
-				t.Errorf("chunk %d is below the %d fixed block size; shrinking blocks to "+
-					"manufacture steal headroom costs more in round trips than it gains",
-					chunk, maxChunk)
+			// Blocks must stay big enough that a round trip per chunk is noise.
+			if chunk < minChunk {
+				t.Errorf("chunk %d is below the %d floor", chunk, minChunk)
+			}
+			// ...and small enough that one chunk is not the entire transfer.
+			if c.size > 4*minChunk && chunk > c.size/8 {
+				t.Errorf("chunk %d is %d%% of a %d byte file; one slow chunk would be the whole job",
+					chunk, 100*chunk/c.size, c.size)
 			}
 		})
 	}

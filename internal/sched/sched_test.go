@@ -663,10 +663,13 @@ func TestRescueHappensAsSoonAsRefetchingBeatsWaiting(t *testing.T) {
 	if !bytes.Equal(out.bytes(), data) {
 		t.Fatal("output does not match the source")
 	}
-	// The fast link needs milliseconds for all five chunks. Anything close to
-	// the slow link's four seconds means we waited instead of deciding.
-	if elapsed > 900*time.Millisecond {
-		t.Errorf("took %v; the rescue is still waiting on a timer rather than "+
+	// The slow link would take four seconds. Rescuing deliberately waits
+	// minRescueGain first, because a link that is merely slower should keep
+	// contributing rather than have every chunk taken from it — without that
+	// floor, cellular at 20 Mbps beside Wi-Fi at 87 was reduced to 0% of the
+	// work. So the bar is "far below the slow link's time", not "instant".
+	if elapsed > minRescueGain+800*time.Millisecond {
+		t.Errorf("took %v; the rescue is still waiting on the slow link rather than "+
 			"comparing refetch against wait", elapsed)
 	}
 	if res.TailSteals == 0 {
